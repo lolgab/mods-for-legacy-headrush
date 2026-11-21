@@ -74,7 +74,7 @@ ones.
 | Registry, picker entry, two instances per pedal, rig save, FX-Loop | confirmed on hardware (v21, v23) |
 | two pairs (four instances), as the earlier NAM A / NAM B build | confirmed (v23) |
 | single pair "NAM" / "NAM 2" (`ids = 2` engine class) | **failed**: only "NAM" showed up; not shipped |
-| the shipped layout, two pairs "NAM" / "NAM TWO" (same code path as NAM A / NAM B) | built; **not yet flashed on hardware** |
+| the shipped layout, two pairs "NAM" / "NAM TWO" (same code path as NAM A / NAM B) | confirmed on hardware (v0.2.1) |
 | combined with the Anxiety OD hijack | built; **not yet flashed on hardware** |
 | NAM audio, level / input trim | confirmed (v25, v26) |
 | dB faders on Level / Tone | confirmed (v27/v28 and later hot-deployed libs) |
