@@ -1,8 +1,9 @@
 # NAM mod for HeadRush Pedalboard, MX5 & Gigboard — Neural Amp Modeler (NAM)
 
-Reverse-engineered firmware mod for the HeadRush Pedalboard, MX5, and Gigboard, adding
-[Neural Amp Modeler](https://github.com/sdatkinson/NeuralAmpModelerCore)
-(NAM, MIT-licensed) neural-network amp-model inference as a pedal.
+Run [Neural Amp Modeler](https://github.com/sdatkinson/NeuralAmpModelerCore)
+(NAM, MIT-licensed) amp and pedal captures on the HeadRush Pedalboard, MX5 and
+Gigboard: an installer that adds NAM to your device's firmware, as new pedals
+on the Pedalboard or in place of the Anxiety OD pedal on every model.
 
 > **Unofficial.** This is an independent community project. It is not
 > affiliated with, endorsed by, or supported by inMusic or HeadRush; "HeadRush",
@@ -28,14 +29,20 @@ NAM, so existing pedalboards that use it keep working. See below.
    **Windows**: it's a `.zip` — unzip it and keep the `.exe` together with
    the `.dll` files next to it; they're required, not optional.
    **macOS**: one universal binary (Apple Silicon and Intel), nothing
-   else to install.
+   else to install. It isn't notarized: if macOS refuses to open it (or the
+   patched updater it builds), right-click it and choose **Open**, or allow it
+   in System Settings → Privacy & Security.
+   **Linux**: the GUI builds a plain `Update_nam.img`. HeadRush ships no Linux
+   updater to flash it with, so to flash from Linux use the Windows build in a
+   VM with USB passthrough, or another computer.
 2. Run it, pick your model (Pedalboard, MX5, or Gigboard), and click **Install
    NAM Mod** — it downloads the official HeadRush firmware updater and builds
    a patched copy of it in the current directory. On the Pedalboard it adds the
    NAM pedals by default; tick **Also make Anxiety OD run NAM** if you have
    pedalboards that use Anxiety OD as the NAM engine and want to keep them
    (see "The pedals" below). MX5 and Gigboard don't have the NAM pedals yet and
-   always use the Anxiety OD design.
+   always use the Anxiety OD design. **Install** stays disabled until you tick
+   **I own this device and accept the risk**.
 3. Put your device in firmware-update mode. See
    [this video](https://www.youtube.com/watch?v=6H90kbOCJG8) for a
    walkthrough.
@@ -68,7 +75,7 @@ need it to recover if a flash goes wrong (see
 ## Loading models
 
 Drop `.nam` files into their own **`/NAM`** folder on the device's USB drive
-(sibling to `Impulse Responses`, `Blocks`, `Rigs`, etc — create it yourself via
+(sibling to `Impulse Responses`, `Blocks`, `Rigs`, etc. — create it yourself via
 the File Manager/USB transfer view if it doesn't exist yet). Files are sorted
 alphabetically; a file's position in that order is its model number. Name them
 with a 3-digit index prefix so the order is explicit:
@@ -77,7 +84,7 @@ with a 3-digit index prefix so the order is explicit:
 - `001 - Second Model.nam`
 - `002 - Third Model.nam`
 
-**NAM pedals**: the **DRIVE** knob shows the model number `1..N` (N = number of
+**NAM pedals**: the **MODEL** knob shows the model number `1..N` (N = number of
 files) and the file name under it, so `000 - First Model.nam` is model 1. Every
 file is reachable, and the knob always lands on a real file.
 
@@ -123,16 +130,15 @@ pedalboard behaves as before.
 
 | Knob | Function | Display |
 |---|---|---|
-| **DRIVE** | selects the `.nam` model | model number `1..N` and the file name |
-| **LEVEL** | input volume | dB, same scale as the FX Loop RETURN |
-| **TONE** | output volume | dB, same scale as the FX Loop SEND |
-| **GAIN** (Low / High) | calibration | **High** = on, see "Gain staging" |
+| **MODEL** | selects the `.nam` model | model number `1..N` and the file name |
+| **INPUT** | input volume | dB, same scale as the FX Loop RETURN |
+| **OUTPUT** | output volume | dB, same scale as the FX Loop SEND |
+| **CALIB** (OFF / ON) | calibration | see "Gain staging" |
 
-The knob captions can't be changed (they are looked up by name in the
-firmware); they stay DRIVE / TONE / LEVEL. Known quirks: the pedal shows
-percentages for a few seconds after the device boots; the name under the number
-can lag behind a fast knob turn until you stop or reopen the page. See
-[docs/NAM_PEDAL_DISPLAY.md](docs/NAM_PEDAL_DISPLAY.md).
+Known quirks: the pedal shows percentages for a few seconds after the device
+boots, while it scans the model files; the file name under the number can lag
+behind a fast knob turn and catches up when you stop turning or reopen the
+page. See [docs/NAM_PEDAL_DISPLAY.md](docs/NAM_PEDAL_DISPLAY.md).
 
 ### Anxiety OD option (all models, opt-in)
 
@@ -145,6 +151,7 @@ NAM engine and want to keep them. On the device, add the **Anxiety OD** pedal.
 | **DRIVE** | selects/scans `.nam` model files |
 | **TONE** | input trim |
 | **LEVEL** | output trim |
+| **Hi-Lo** | calibration (Hi = on), see "Gain staging" |
 
 This is a *hijack*: Anxiety OD loses its real overdrive function board-wide,
 on every instance. The two options can be installed together on the Pedalboard.
@@ -181,18 +188,18 @@ flashing another model's file will almost certainly brick the device.
 
 ## Gain staging
 
-**NAM pedals**: LEVEL (input) and TONE (output) are dB faders from -60 dB to
+**NAM pedals**: INPUT and OUTPUT are dB faders from -60 dB to
 +12 dB (0 dB = unity), the same scale and display as the FX Loop SEND/RETURN.
 The bottom of the travel is silence.
 
 **Calibration** (the Anxiety OD option's Hi-Lo switch does the same): set the
-NAM pedal's **GAIN** switch to **High** and the pedal calibrates itself from the
+NAM pedal's **CALIB** switch to **ON** and the pedal calibrates itself from the
 `.nam` file's metadata. The input is scaled so the model's own input level
 (dBu at 0 dBFS in its training capture) lines up with a 12.2 dBu interface, the
 rule the NAM plugin uses, and the output is normalized to the model's stated
 loudness (target -18 dB), so switching models keeps roughly the same volume.
 Both are capped at +-24 dB, files without that metadata are left untouched, and
-TONE / LEVEL still trim on top. **Low** (the default) leaves the signal as is.
+INPUT / OUTPUT still trim on top. **OFF** (the default) leaves the signal as is.
 
 **Anxiety OD option**: TONE and LEVEL are both **unity at 50%**, then diverge:
 
@@ -223,6 +230,9 @@ TONE / LEVEL still trim on top. **Low** (the default) leaves the signal as is.
   added to the firmware.
 - [docs/NAM_PEDAL_DISPLAY.md](docs/NAM_PEDAL_DISPLAY.md) — the dB faders and
   the model readout, and what doesn't work.
+- [docs/QML_PAGES.md](docs/QML_PAGES.md) — the parameter names and detail
+  pages of the NAM pedals.
+- [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md) — the footswitch page-turner.
 - [docs/BUILDING.md](docs/BUILDING.md) — building `nam-mod-gui` from
   source.
 

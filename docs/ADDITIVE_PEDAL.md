@@ -80,17 +80,16 @@ ones.
 | dB faders on Level / Tone | confirmed (v27/v28 and later hot-deployed libs) |
 | Calibration on the Gain Low/High switch (High = on): input + output normalization | confirmed on hardware |
 | Drive readout (number + file name) | hot-deployed only; consistency of the last build unconfirmed |
-| Captions DRIVE / LEVEL / TONE | cannot be changed (see NAM_PEDAL_DISPLAY.md) |
-| Pedal art | missing: `img/NAM.png` falls back to `img/Other.png` |
-| Patch committed / in the GUI | not committed; CLI only (`--additive`) |
+| Captions MODEL / INPUT / OUTPUT / CALIB | set at install time by the QML edit ([QML_PAGES.md](QML_PAGES.md)) |
+| Pedal art | drawn by our own QML (`pedal_art.qml`) in place of the generic picture |
+| In the GUI | shipped since v0.2.1, on by default on the Pedalboard |
 
 ## Open items
 
 * Drive readout can show the previous model's name until the value moves again;
   needs a UI repaint trigger or a decision to show the number only.
-* The patch is not in the shipped GUI pipeline's defaults and not committed.
-* Art and captions for the pedal; a generalization to N pairs (the registry
-  constants derive from the pair count, but the node-registration hooks still
-  assume the ids 167.. of the pairs they are given and seven parameters (Glorious
-  Drive's), which is fine for up to `NAM_MAX_PAIRS`).
+* A generalization to N pairs (the registry constants derive from the pair
+  count, but the node-registration hooks still assume the ids 167.. of the
+  pairs they are given and seven parameters (Glorious Drive's), which is fine
+  for up to `NAM_MAX_PAIRS`).
 * Debug logging (`[nam_disp]`, `[nam_eng]`) should be trimmed before release.

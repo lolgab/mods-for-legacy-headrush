@@ -17,7 +17,9 @@ Code: `patch/nam_hook.cpp` (the "display" section at the end of the file,
 | Level | input volume          | dB, same scale as the FX-Loop *Return*    |
 | Tone  | output volume         | dB, same scale as the FX-Loop *Send*      |
 
-The captions (DRIVE / LEVEL / TONE) cannot be changed; see "Dead ends".
+The editor shows these as MODEL / INPUT / OUTPUT (and the Gain switch as CALIB OFF / ON): the captions are swapped
+at install time by the QML edit in [QML_PAGES.md](QML_PAGES.md). Renaming the parameters themselves does not work;
+see "Dead ends".
 
 ## How the UI gets its text
 
@@ -114,9 +116,8 @@ and the engine class. Relevant to display:
 
 ## Dead ends (do not retry)
 
-* **Changing the captions DRIVE / LEVEL / TONE.** Editing only the embedded
-  QML source is ignored on hardware (compiled units win; the way around that is
-  in [QML_PAGES.md](QML_PAGES.md)). Renaming the parameter-name table
+* **Renaming the parameters to change the captions.** (The captions are now
+  changed in QML instead, see [QML_PAGES.md](QML_PAGES.md).) Renaming the parameter-name table
   (`--rename-params`, build v29) kept the old captions and **removed the
   numbers**: the editor looks parameters up by their original names. Same
   failure as renaming the pedal title.
