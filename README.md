@@ -163,21 +163,27 @@ blocks on a board, so by default that's 2 NAM instances max, and Anxiety OD
 the same way, for up to 4 hijacked NAM instances total — at the cost of losing
 Anxiety OD V2's real sound board-wide too.
 
-## NAM Lite / NAM Full
+## NAM quality: Auto / Lite / Full
 
-A2 models come in two sizes. **NAM Lite** (the default) runs the small one,
-cheap enough for several NAM pedals on one rig. **NAM Full** runs the full
-model, the same sound as on a computer, but it takes about two thirds of the
-board's CPU. Pick it per pedal with the **LITE** / **FULL** buttons on the NAM
-pedal's detail page (Pedalboard; it is saved with the preset). With Full:
+A2 models come in two sizes: a small one (Lite, cheap enough for several NAM
+pedals on one rig) and the full one (the same sound as on a computer, about two
+thirds of the board's CPU). Pick how the NAM pedals use them with the
+**AUTO** / **LITE** / **FULL** buttons on a NAM pedal's detail page
+(Pedalboard). The choice applies to every NAM pedal and is kept across reboots.
 
-- use **one NAM at a time**, with a mono signal into it (no stereo effect
-  before it);
-- turn HeadRush's **Tails** setting **off**: with Tails on, a rig
-  change keeps the old rig running next to the new one, two NAMs at once,
-  which crackles.
+- **AUTO** (default): Full when it fits, Lite otherwise. One NAM on a mono
+  signal gets Full; adding a second NAM switches them to Lite. If a Full pedal
+  then gets a stereo signal or runs out of CPU, it drops to Lite; press AUTO
+  again to retry Full.
+- **LITE**: always the small size. No measuring and no reload when NAM pedals
+  come and go, for fast rig changes.
+- **FULL**: always the full size. Use **one NAM at a time**, with a mono signal
+  into it, and turn HeadRush's **Tails** setting **off** (with Tails on, a rig
+  change keeps the old rig running next to the new one: two NAMs at once,
+  which crackles).
 
-Other (non-A2) models sound the same either way. Not yet tested on hardware.
+Switching reloads the model with a short fade. Other (non-A2) models sound the
+same in every mode. Not yet tested on hardware.
 
 ## Reverb pedals (optional, Pedalboard only, experimental)
 

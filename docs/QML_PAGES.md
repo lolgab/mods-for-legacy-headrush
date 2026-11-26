@@ -64,12 +64,14 @@ INPUT (Level), OUTPUT (Tone), CALIBRATION (the Gain switch); Reverb: DECAY (Driv
 The tile captions are edited too (`EncoderParamInfo.qml`, table above): the tiles show MODEL / INPUT / OUTPUT / CALIB for NAM
 (the Gain tile's Low / High read OFF / ON) and DECAY / MIX / DAMPING for Reverb.
 
-## NAM: Lite / Full
+## NAM: quality (Auto / Lite / Full)
 
-`nam_ui.qml` has LITE / FULL buttons under the parameters. They set the pedal's **Hi-Cut** switch (engine byte `0x57f`,
-On by default; its tile is hidden on NAM pedals, and the preset saves it): On = Lite, Off = Full. The hook reads that
-byte every block (`kEngQualityByte` in `patch/nam_hook.cpp`) and reloads the model at the other size when it changes.
-See docs/TECHNICAL.md, "CPU budget", for what Full costs.
+`nam_ui.qml` has AUTO / LITE / FULL buttons under the parameters. They don't use a pedal switch: the mode is one
+setting for all NAM pedals, kept by the hook (docs/TECHNICAL.md, "CPU budget"). With no `XMLHttpRequest` the page
+can't call the hook, so a button sets an invisible `Image` to `file:///tmp/nam_mode/<auto|lite|full>.png?<time>`
+(an image is always read from disk; a QML file may be served from the QML disk cache) and the hook, watching that
+folder with inotify, sees which one was opened. The hook writes the current mode to `/tmp/nam_mode_state.qml`, which
+the page loads (with its own `?<time>`) when it opens and 400 ms after a click.
 
 ## Reverb: algorithm selector
 

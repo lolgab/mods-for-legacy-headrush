@@ -40,16 +40,22 @@ everything on the board. Measured on the Pedalboard with the NAM pedals:
   about **680 us** per channel for the large one and about **104 us** for the
   small one. Calibration picks the largest that fits a per-instance budget
   (`1000 us / running instances`, with a 50% safety margin) and in practice
-  always lands on the small one. This is **NAM Lite**, the default.
-- **NAM Full** (the LITE / FULL buttons on a NAM pedal's detail page, stored
-  in its hidden Hi-Cut switch: On = Lite, Off = Full) skips the calibration
-  and always runs the large size; switching reloads the model with the same
-  duck-out / duck-in as a model change. One NAM on a mono input (dual mono, below: one model run) is ~680 us
-  of the 1000 us block, so it fits only **one active NAM** and only with the
-  HeadRush **Tails** setting **off**: with Tails on, a rig change keeps the
-  old rig running next to the new one, two NAMs at once. A stereo effect
-  before the NAM doubles the cost and overruns too. Non-A2 models are not
-  affected by Lite / Full. Not yet measured on hardware.
+  always lands on the small one. This is the original rule, still used for
+  Anxiety OD.
+- **NAM quality** (AUTO / LITE / FULL buttons on a NAM pedal's detail page,
+  one mode for all NAM pedals, saved in `<model dir>/nam_quality.txt`; see
+  `namespace quality` in `patch/nam_hook.cpp`). Anxiety OD keeps the rule
+  above. **AUTO** calibrates with 1 channel (the dual-mono case below) and a
+  75% margin, so a single NAM gets Full (~680 us) and two get Lite; while on
+  Full, a watchdog drops it to Lite after ~50 ms of stereo input or 3 blocks
+  over 850 us (this pedal's own time) within 2 s, until AUTO is picked again.
+  **LITE** / **FULL** fix the size: no calibration, no reload when an instance
+  joins. Full fits one active NAM on a mono input with Tails **off** (with
+  Tails on, a rig change keeps the old rig running: two NAMs at once). The
+  page talks to the hook through files: a button loads
+  `/tmp/nam_mode/<mode>.png` (the hook watches the opens with inotify) and the
+  hook writes `/tmp/nam_mode_state.qml` back. `patch/test_nam_quality.c`
+  exercises it all on ARM. Not yet measured on hardware.
 - Each instance runs one model per channel. Run as two channels, an instance
   costs ~250 us per block, so **three active NAMs (~780 us) overran** while two
   (~520 us) did not; the symptom was crackle until a scene deactivated one.

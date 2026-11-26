@@ -26,14 +26,21 @@ Column {
 	property string calibText: gain && gain.translator ? (gain.translator.index === 1 ? "ON" : "OFF") : ""
 	property string expected: idx >= 0 ? Math.round(raw) + " " + names[idx] : ""
 
-	// NAM Lite / Full: the hook reads the Hi-Cut switch (hidden tile, saved with the preset): On = Lite, Off = Full
-	property var hicut: pedal !== "" ? Evil.getProperty("/Engine/Patch/" + pedal + "/Hi-Cut") : null
-	property int quality: hicut && hicut.translator ? (hicut.translator.index === 0 ? 1 : 0) : -1
-	readonly property var qualityNames: ["LITE", "FULL"]
-	readonly property var qualityNotes: ["several NAMs per rig", "1 NAM, mono in, Tails off"]
+	// NAM quality, one mode for every NAM pedal (namespace quality in nam_hook.cpp). This Qt has no XMLHttpRequest:
+	// a button loads /tmp/nam_mode/<mode>.png and the hook sees the file being opened; the hook writes the current
+	// mode to /tmp/nam_mode_state.qml.
+	readonly property var qualityFiles: ["auto", "lite", "full"]
+	readonly property var qualityNames: ["AUTO", "LITE", "FULL"]
+	readonly property var qualityNotes: ["Full when it fits", "fast rig changes", "1 NAM, Tails off"]
+	property int quality: modeState.item ? modeState.item.mode : -1
+	property string trigger: ""
+	property double modeStamp: new Date().getTime()
+	Loader { id: modeState; source: "file:///tmp/nam_mode_state.qml?" + root.modeStamp }
+	Image { width: 1; height: 1; opacity: 0; cache: false; source: root.trigger }
+	Timer { id: modeRefresh; interval: 400; onTriggered: root.modeStamp = new Date().getTime() }
 	function chooseQuality(q) {
-		if (hicut && hicut.translator)
-			hicut.translator.index = q === 1 ? 0 : 1
+		trigger = "file:///tmp/nam_mode/" + qualityFiles[q] + ".png?" + new Date().getTime()
+		modeRefresh.restart()
 	}
 
 	Loader { id: modelList; source: "file:///tmp/nam_models.qml?" + root.stamp }
@@ -74,13 +81,13 @@ Column {
 	Row {
 		spacing: 12
 		Repeater {
-			model: 2
+			model: 3
 			Rectangle {
-				width: 354; height: 80; radius: 4
+				width: 232; height: 80; radius: 4
 				color: root.quality === index ? "#2f6b27" : "#2b2c2e"
 				border.width: 2; border.color: root.quality === index ? "#44F511" : "#555"
-				Text { x: 16; y: 8; color: "white"; font.pixelSize: 30; text: root.qualityNames[index] }
-				Text { x: 16; y: 46; width: 322; elide: Text.ElideRight; color: "#9fd99a"; font.pixelSize: 22; text: root.qualityNotes[index] }
+				Text { x: 14; y: 8; color: "white"; font.pixelSize: 30; text: root.qualityNames[index] }
+				Text { x: 14; y: 46; width: 204; elide: Text.ElideRight; color: "#9fd99a"; font.pixelSize: 20; text: root.qualityNotes[index] }
 				MouseArea { anchors.fill: parent; onClicked: root.chooseQuality(index) }
 			}
 		}

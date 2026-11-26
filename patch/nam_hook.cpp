@@ -69,7 +69,9 @@
 #include <pthread.h>
 #include <signal.h>
 #include <string>
+#include <sys/inotify.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <type_traits>
 #include <map>
@@ -345,8 +347,11 @@ struct CalibrationEntry
 {
   double ratio = -1.0;
   int epoch = -1;
+  bool no_full = false; // AUTO only: calibrated with the Full size excluded (see ModelState::auto_full_blocked)
+  bool top = false;     // the chosen ratio is the model's largest size
 };
-std::vector<CalibrationEntry> g_calibration_cache;
+std::vector<CalibrationEntry> g_calibration_cache; // Anxiety OD (the original rule)
+std::vector<CalibrationEntry> g_auto_cache;        // additive NAM pedals in AUTO (the AUTO rule)
 std::mutex g_calibration_cache_mutex;
 
 // Bumped every time state_for() claims a brand-new instance slot (i.e. a
@@ -431,6 +436,7 @@ void preload_models_in_background()
               [](const CachedModel& a, const CachedModel& b) { return a.display_name < b.display_name; });
 
     g_calibration_cache.assign(found.size(), CalibrationEntry{});
+    g_auto_cache.assign(found.size(), CalibrationEntry{});
     g_cached_models = std::move(found);
     g_models_ready.store(true, std::memory_order_release);
   });
@@ -510,14 +516,24 @@ struct ModelState
   // could be mid-call on the very same object.
   std::unique_ptr<nam::DSP> pending_dsp[kMaxChannels];
   int pending_index = -1; // set before pending_ready; read only after
-  // NAM Lite / Full (A2 models only, see calibrate_slimmable_quality): want_full is the pedal's setting, written by
-  // the audio thread every block (additive NAM pedals: their Hi-Cut switch, set from the LITE / FULL buttons of
-  // ui/nam_ui.qml; Anxiety OD: always Lite). The loader reads it once per load and records what it built in
-  // pending_full (set before pending_ready, like pending_index); active_full is what is playing (audio thread only).
-  // A difference between the two sends the pedal through the same duck-out/reload/duck-in cycle as a model change.
-  std::atomic<bool> want_full{false};
+  // NAM quality (A2 models, see namespace quality): the loader records the mode it built under and whether it built
+  // the largest size in pending_mode / pending_full (set before pending_ready, like pending_index); active_mode /
+  // active_full are what is playing (audio thread only). A mode other than the selected one sends the pedal through
+  // the same duck-out/reload/duck-in cycle as a model change.
+  int pending_mode = -1;
   bool pending_full = false;
+  int active_mode = -1;
   bool active_full = false;
+  // AUTO's watchdog (audio thread): set when an AUTO pedal running the Full size sees a stereo input or overruns; the
+  // reload that follows calibrates without the Full size. The loader reads it, hence atomic. Cleared when AUTO is
+  // picked again on the page (quality::g_gen), which also retries Full (auto_retry).
+  std::atomic<bool> auto_full_blocked{false};
+  bool auto_retry = false;
+  int seen_mode_gen = 0;
+  int stereo_blocks = 0;
+  int overruns = 0;
+  int64_t overrun_window_ms = 0;
+  uint32_t last_block_us = 0; // this pedal's own process() time in the previous block (audio thread only)
   std::atomic<bool> pending_ready{false};
   // 0=steady, 1=fading out the old model, 2=fading in the new one. Atomic
   // because switch_model_in_background (background thread) reads it to
@@ -732,12 +748,167 @@ int count_claimed_instances()
   return n;
 }
 
-// This is NAM Lite, the default. NAM Full (a pedal's FULL button, see ModelState::want_full) skips it and runs the
-// largest size: ~680 us per channel against a 1000 us block shared by the whole board, so it only fits one active NAM
-// on a mono input (dual mono runs one model, see nam_process_common), with the HeadRush "Tails" setting off (with Tails
-// on, a rig change keeps the old rig running next to the new one: two NAMs for a while).
-double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable)
+// NAM quality: which size A2 models run at, picked on the NAM pedal's detail page (ui/nam_ui.qml), one mode for every
+// additive NAM pedal, kept across reboots in <model dir>/nam_quality.txt. A2 models measured here have two sizes,
+// ~104 us (Lite) and ~680 us (Full) per channel, against a 1000 us block shared by the whole board.
+//   AUTO  (default) calibrate: the largest size that fits 75% of 1000 us / active NAMs on a mono input, so one NAM gets
+//         Full and two get Lite; a new NAM joining recalibrates. While on Full a watchdog drops to Lite on a stereo
+//         input or repeated overruns (ModelState::auto_full_blocked) until AUTO is picked again.
+//   LITE  always the smallest size: no calibration, no reload when NAMs are added (fast rig changes).
+//   FULL  always the largest: one NAM at a time, mono input, HeadRush "Tails" off (with Tails on, a rig change keeps
+//         the old rig running next to the new one: two NAMs for a while).
+// Anxiety OD (the hijack) keeps the original rule (kLegacy): 2 channels, 50% margin, in practice always Lite.
+//
+// The page can't call into the hook (this Qt has no XMLHttpRequest) and can't write files: its buttons load a tiny
+// image, /tmp/nam_mode/<auto|lite|full>.png?<time>, and a thread here sees the open through inotify. An Image is used
+// rather than a QML file because the QML disk cache may skip reading a file it already compiled. The hook writes the
+// selection back as /tmp/nam_mode_state.qml for the page to show.
+namespace quality
 {
+enum Mode : int
+{
+  kAuto = 0,
+  kLite = 1,
+  kFull = 2,
+  kLegacy = 3, // Anxiety OD
+};
+const char* const kNames[3] = {"auto", "lite", "full"};
+std::atomic<int> g_mode{kAuto};
+std::atomic<int> g_gen{0}; // bumped on every selection, also of the mode already selected (AUTO again = retry Full)
+const char* const kDir = "/tmp/nam_mode";
+const char* const kState = "/tmp/nam_mode_state.qml";
+
+std::filesystem::path conf_path()
+{
+  return model_dir() / "nam_quality.txt";
+}
+
+void write_file_atomically(const std::string& path, const std::string& text)
+{
+  const std::string tmp = path + ".tmp";
+  if (FILE* f = std::fopen(tmp.c_str(), "w"))
+  {
+    const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    if (std::fclose(f) == 0 && ok && std::rename(tmp.c_str(), path.c_str()) == 0)
+      return;
+  }
+  std::fprintf(stderr, "[nam_mode] could not write %s: %s\n", path.c_str(), std::strerror(errno));
+}
+
+void write_state(int m)
+{
+  write_file_atomically(kState, "import QtQuick 2.2\nQtObject { property int mode: " + std::to_string(m) + " }\n");
+}
+
+int load_saved()
+{
+  std::ifstream f(conf_path());
+  std::string word;
+  if (f >> word)
+    for (int i = 0; i < 3; ++i)
+      if (word == kNames[i])
+        return i;
+  return kAuto;
+}
+
+void select(int m)
+{
+  g_mode.store(m, std::memory_order_release);
+  g_gen.fetch_add(1, std::memory_order_acq_rel);
+  write_state(m);
+  write_file_atomically(conf_path().string(), std::string(kNames[m]) + "\n");
+  std::fprintf(stderr, "[nam_mode] %s\n", kNames[m]);
+}
+
+void watch()
+{
+  // 1x1 transparent PNG: what the page's Image loads
+  static const unsigned char kPng[] = {
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00,
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00,
+    0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00, 0x00, 0x05, 0x00,
+    0x01, 0x7a, 0x5e, 0xab, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
+  ::mkdir(kDir, 0755);
+  for (const char* name : kNames)
+    write_file_atomically(std::string(kDir) + "/" + name + ".png", std::string(reinterpret_cast<const char*>(kPng), sizeof(kPng)));
+  const int fd = inotify_init1(IN_CLOEXEC);
+  if (fd < 0 || inotify_add_watch(fd, kDir, IN_OPEN) < 0)
+  {
+    std::fprintf(stderr, "[nam_mode] inotify on %s failed: %s\n", kDir, std::strerror(errno));
+    return;
+  }
+  alignas(inotify_event) char buf[4096];
+  for (;;)
+  {
+    const ssize_t n = read(fd, buf, sizeof(buf));
+    if (n <= 0)
+    {
+      if (n < 0 && errno == EINTR)
+        continue;
+      std::fprintf(stderr, "[nam_mode] inotify read ended: %s\n", std::strerror(errno));
+      return;
+    }
+    for (char* p = buf; p < buf + n;)
+    {
+      const auto* ev = reinterpret_cast<const inotify_event*>(p);
+      if (ev->len > 0)
+        for (int i = 0; i < 3; ++i)
+          if (std::string(ev->name) == std::string(kNames[i]) + ".png")
+            select(i);
+      p += sizeof(inotify_event) + ev->len;
+    }
+  }
+}
+
+// once, from nam_eng_init (the additive NAM pedals' display init)
+void start()
+{
+  static std::atomic<bool> started{false};
+  bool expected = false;
+  if (!started.compare_exchange_strong(expected, true))
+    return;
+  const int m = load_saved();
+  g_mode.store(m, std::memory_order_release);
+  write_state(m);
+  std::fprintf(stderr, "[nam_mode] start: %s (%s)\n", kNames[m], conf_path().c_str());
+  spawn_detached([]() { watch(); });
+}
+} // namespace quality
+
+// the ARM test (patch/test_nam_quality.c) starts it directly; on the device nam_eng_init does
+extern "C" void nam_quality_start()
+{
+  quality::start();
+}
+
+// AUTO: share of the per-NAM budget the model may take. NAM_AUTO_MARGIN overrides it (tests under emulation, where
+// everything is several times slower, use a large one to get Full).
+double auto_safety_margin()
+{
+  if (const char* env = std::getenv("NAM_AUTO_MARGIN"))
+    return std::strtod(env, nullptr);
+  return 0.75;
+}
+// AUTO watchdog: a block of this pedal alone over this counts as an overrun (NAM_AUTO_OVERRUN_US overrides it, tests)
+uint32_t auto_overrun_us()
+{
+  static const uint32_t us = [] {
+    const char* env = std::getenv("NAM_AUTO_OVERRUN_US");
+    return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 850u;
+  }();
+  return us;
+}
+constexpr int kAutoOverruns = 3;           // ... this many within 2 s drop Full
+constexpr int kAutoStereoBlocks = 50;      // ... as do this many blocks in a row (~50 ms) of stereo input
+
+// Picks the largest size whose benchmark fits. `channels` is how many model runs per block are assumed (Anxiety OD's
+// original rule: 2, the stereo worst case; AUTO: 1, the dual-mono case, with the watchdog covering stereo), `margin`
+// the share of the per-instance budget allowed, `allow_top` false skips the largest size. *top tells whether the
+// largest size was picked.
+double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable, int channels, double margin,
+                                   bool allow_top, bool* top)
+{
+  *top = false;
   const int concurrent_instances = std::max(1, count_claimed_instances());
   const double budget_us = static_cast<double>(kCalibrationBlockSize) / kSampleRate * 1e6 / concurrent_instances;
   const auto breakpoints = slimmable.GetSlimmableSizeBreakpoints();
@@ -759,6 +930,8 @@ double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable
   // "Full"). Measured on hardware per channel: ~680 us for the large size, ~104 us for the small one.
   for (size_t tier = num_tiers; tier-- > 0;) // highest quality first
   {
+    if (!allow_top && num_tiers > 1 && tier == num_tiers - 1)
+      continue;
     const double ratio = (static_cast<double>(tier) + 0.5) / static_cast<double>(num_tiers);
     slimmable.SetSlimmableSize(ratio);
     dsp.Reset(kSampleRate, kCalibrationBlockSize); // re-warm at this tier before timing
@@ -772,12 +945,14 @@ double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable
                            / static_cast<double>(kCalibrationIters);
 
     // the benchmark runs ONE channel's model; instances normally run one (dual-mono input, see nam_process_common) but
-    // two when the input is true stereo, so the conservative cost is avg_us * kMaxChannels
+    // two when the input is true stereo
     std::fprintf(stderr, "[nam_cal] instances=%d budget=%.0fus tier=%zu/%zu ratio=%.2f avg=%.0fus x%d channels need<%.0fus\n",
-                 concurrent_instances, budget_us, tier, num_tiers, ratio, avg_us, static_cast<int>(kMaxChannels),
-                 budget_us * kCalibrationSafetyMargin);
-    if (avg_us * kMaxChannels < budget_us * kCalibrationSafetyMargin)
+                 concurrent_instances, budget_us, tier, num_tiers, ratio, avg_us, channels, budget_us * margin);
+    if (avg_us * channels < budget_us * margin)
+    {
+      *top = num_tiers > 1 && tier == num_tiers - 1;
       return ratio;
+    }
   }
   std::fprintf(stderr, "[nam_cal] nothing fit the budget: falling back to the minimum tier\n");
   return 0.0; // nothing fit safely -- fall back to minimum/Lite
@@ -842,7 +1017,9 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
       } reset{s.switching};
 
       const int idx = knob_value_to_index(raw, static_cast<int>(g_cached_models.size()));
-      const bool full = s.want_full.load(std::memory_order_acquire);
+      const int mode = s.is_eng.load(std::memory_order_acquire) ? quality::g_mode.load(std::memory_order_acquire)
+                                                                 : static_cast<int>(quality::kLegacy);
+      const bool no_full = s.auto_full_blocked.load(std::memory_order_acquire);
       if (idx == -2 || (idx == s.active_index.load(std::memory_order_acquire) && !force_reload_same_model))
         return; // no files found at all, or knob moved but landed back on the same state
                 // (unless a forced recalibration deliberately wants this same model rebuilt)
@@ -856,7 +1033,8 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
         for (int i = 0; i < kMaxChannels; ++i)
           s.pending_dsp[i].reset();
         s.pending_index = idx;
-        s.pending_full = full;
+        s.pending_mode = mode;
+        s.pending_full = false;
         s.pending_ready.store(true, std::memory_order_release);
         return;
       }
@@ -864,6 +1042,7 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
 
       std::unique_ptr<nam::DSP> loaded[kMaxChannels];
       double chosen_ratio = 1.0;
+      bool built_full = false;
       constexpr int32_t kPrewarmSamples = 16384;
       constexpr int32_t kPrewarmBlockSize = 128;
       for (int i = 0; i < kMaxChannels; ++i)
@@ -896,29 +1075,37 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
           // internal sub-model reconstruction per tier tested) on every
           // single switch was pure avoidable churn once a model has already
           // been calibrated once.
-          if (i == 0 && full)
+          if (i == 0 && (mode == quality::kLite || mode == quality::kFull))
           {
-            // NAM Full: the largest size, no calibration (see calibrate_slimmable_quality's comment for the cost)
-            chosen_ratio = 1.0;
+            // LITE / FULL: a fixed size, no calibration (see namespace quality)
+            chosen_ratio = mode == quality::kFull ? 1.0 : 0.0;
             slimmable->SetSlimmableSize(chosen_ratio);
-            std::fprintf(stderr, "[nam_load] model %d tier=full instances=%d\n", idx, count_claimed_instances());
+            built_full = mode == quality::kFull && !slimmable->GetSlimmableSizeBreakpoints().empty();
+            std::fprintf(stderr, "[nam_load] model %d mode=%s tier=%.2f instances=%d\n", idx, quality::kNames[mode],
+                         chosen_ratio, count_claimed_instances());
           }
           else if (i == 0)
           {
+            const bool is_auto = mode == quality::kAuto;
             std::lock_guard<std::mutex> lock(g_calibration_cache_mutex);
-            auto& entry = g_calibration_cache[static_cast<size_t>(idx)];
+            auto& entry = (is_auto ? g_auto_cache : g_calibration_cache)[static_cast<size_t>(idx)];
             const int live_epoch = g_topology_epoch.load(std::memory_order_acquire);
             // Stale-by-epoch counts as a miss too, not just never-calibrated
             // -- see CalibrationEntry's own comment.
-            if (entry.ratio < 0.0 || entry.epoch != live_epoch)
+            if (entry.ratio < 0.0 || entry.epoch != live_epoch || entry.no_full != (is_auto && no_full))
             {
-              entry.ratio = calibrate_slimmable_quality(*d, *slimmable);
+              entry.ratio = is_auto ? calibrate_slimmable_quality(*d, *slimmable, 1, auto_safety_margin(), !no_full, &entry.top)
+                                    : calibrate_slimmable_quality(*d, *slimmable, kMaxChannels, kCalibrationSafetyMargin,
+                                                                  true, &entry.top);
               entry.epoch = live_epoch;
+              entry.no_full = is_auto && no_full;
             }
             else
               slimmable->SetSlimmableSize(entry.ratio);
             chosen_ratio = entry.ratio;
-            std::fprintf(stderr, "[nam_load] model %d tier=%.2f instances=%d epoch=%d\n", idx, chosen_ratio,
+            built_full = entry.top;
+            std::fprintf(stderr, "[nam_load] model %d mode=%s tier=%.2f%s instances=%d epoch=%d\n", idx,
+                         is_auto ? "auto" : "legacy", chosen_ratio, is_auto && no_full ? " (full blocked)" : "",
                          count_claimed_instances(), live_epoch);
           }
           else
@@ -998,7 +1185,8 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
       for (int i = 0; i < kMaxChannels; ++i)
         s.pending_dsp[i] = std::move(loaded[i]);
       s.pending_index = idx;
-      s.pending_full = full;
+      s.pending_mode = mode;
+      s.pending_full = built_full;
       s.pending_ready.store(true, std::memory_order_release);
     }
     catch (...)
@@ -1116,11 +1304,6 @@ float raised_cosine_ramp(int32_t progress, int32_t len)
 // Where the three knobs and the bypass byte live inside the hijacked engine object, plus how the trims are
 // curved. Anxiety OD's and the additive NAM pedals' engines (a Glorious Drive clone) have the same shape at
 // different offsets.
-// Additive NAM pedals: their Hi-Cut switch (a byte, On by default, saved with the preset; the stock tile is hidden on
-// NAM pedals) is the Lite / Full setting: On = Lite, Off = Full. ui/nam_ui.qml sets it from its LITE / FULL buttons.
-// The Reverb pedals use the same byte for their algorithm (default_reverb_algo) but never reach nam_process_common.
-constexpr uint32_t kEngQualityByte = 0x57f;
-
 struct KnobLayout
 {
   uint32_t model, input, output, bypass, hilo;
@@ -1240,6 +1423,7 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
     {
       const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
       const uint32_t us = static_cast<uint32_t>(ns / 1000);
+      st.last_block_us = us;
       st.cpu_sum_ns.fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
       if (us > st.cpu_max_us.load(std::memory_order_relaxed))
         st.cpu_max_us.store(us, std::memory_order_relaxed);
@@ -1278,8 +1462,6 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
   const float tone_raw = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(this_) + kl.input);   // input trim
   const float level_raw = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(this_) + kl.output); // output trim
   const uint8_t bypass_byte = *(reinterpret_cast<uint8_t*>(this_) + kl.bypass);
-  if (kl.db_trim) // additive NAM pedals only; Anxiety OD stays Lite
-    s.want_full.store(*(reinterpret_cast<uint8_t*>(this_) + kEngQualityByte) == 0, std::memory_order_release);
 
   // Bypass is checked further down now, right before the first place it
   // actually needs to change behavior (the produced audio) -- NOT here.
@@ -1369,14 +1551,30 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
     // CalibrationEntry) then recalculates its tier against the new,
     // smaller budget instead of reusing the stale cached one.
     //
-    // The same cycle switches a pedal between NAM Lite and NAM Full (ModelState::want_full). A Full model doesn't
-    // depend on the budget, so a new instance joining doesn't reload it.
-    const bool quality_changed = s.active_full != s.want_full.load(std::memory_order_acquire);
-    const bool epoch_stale = !s.active_full
+    // The same cycle applies the NAM quality mode (namespace quality): a new mode picked on the page, AUTO's watchdog
+    // dropping Full, or AUTO picked again (retry Full). Only calibrated modes (AUTO, Anxiety OD) depend on the budget,
+    // so only they reload when an instance joins.
+    const int want_mode = s.is_eng.load(std::memory_order_relaxed) ? quality::g_mode.load(std::memory_order_acquire)
+                                                                    : static_cast<int>(quality::kLegacy);
+    const int gen = quality::g_gen.load(std::memory_order_acquire);
+    if (gen != s.seen_mode_gen)
+    {
+      s.seen_mode_gen = gen;
+      if (want_mode == quality::kAuto)
+      {
+        s.auto_full_blocked.store(false, std::memory_order_release);
+        s.auto_retry = s.active_mode == quality::kAuto && !s.active_full;
+      }
+    }
+    const bool mode_changed = s.active_mode != want_mode;
+    const bool auto_downgrade = s.active_mode == quality::kAuto && s.active_full
+                                && s.auto_full_blocked.load(std::memory_order_acquire);
+    const bool epoch_stale = (s.active_mode == quality::kAuto || s.active_mode == quality::kLegacy)
                              && s.calibrated_epoch.load(std::memory_order_acquire) != g_topology_epoch.load(std::memory_order_acquire);
     if (s.fade_state.load(std::memory_order_relaxed) == 0 && s.active_index.load(std::memory_order_acquire) >= 0
-        && (epoch_stale || quality_changed))
+        && (epoch_stale || mode_changed || auto_downgrade || s.auto_retry))
     {
+      s.auto_retry = false;
       s.force_recalibrate = true;
       s.fade_state.store(1, std::memory_order_relaxed);
       s.fade_progress = 0;
@@ -1438,6 +1636,7 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
         s.dsp[i] = std::move(s.pending_dsp[i]);
       s.active_index.store(s.pending_index, std::memory_order_release);
       s.active_full = s.pending_full;
+      s.active_mode = s.pending_mode;
       s.pending_ready.store(false, std::memory_order_release);
       s.ready.store(true, std::memory_order_release);
       ready = true;
@@ -1453,6 +1652,7 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
         s.dsp[i] = std::move(s.pending_dsp[i]);
       s.active_index.store(s.pending_index, std::memory_order_release);
       s.active_full = s.pending_full;
+      s.active_mode = s.pending_mode;
       s.pending_ready.store(false, std::memory_order_release);
       s.fade_progress = 0;
       s.fade_state.store(s.pending_index < 0 ? 0 : 2, std::memory_order_relaxed);
@@ -1512,6 +1712,31 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
   const bool dual_mono = numChannels == 2 && input[0] && input[1] && output[0] && output[1] && !silent_active
                          && std::memcmp(output[0], output[1], static_cast<size_t>(numFrames) * sizeof(float)) == 0;
   const uint32_t dsp_channels = dual_mono ? 1u : numChannels;
+  // AUTO's watchdog (namespace quality): Full was picked for a mono input with some headroom; a stereo input (two model
+  // runs) or repeated overruns of this pedal's own block time drop it to the next size (the reload happens in the
+  // steady-state check above, next block).
+  if (s.active_mode == quality::kAuto && s.active_full && fade_state == 0 && !silent_active
+      && !s.auto_full_blocked.load(std::memory_order_relaxed))
+  {
+    if (!dual_mono && numChannels == 2)
+    {
+      if (++s.stereo_blocks >= kAutoStereoBlocks)
+        s.auto_full_blocked.store(true, std::memory_order_release);
+    }
+    else
+      s.stereo_blocks = 0;
+    if (s.last_block_us > auto_overrun_us())
+    {
+      const int64_t now = now_ms();
+      if (now - s.overrun_window_ms > 2000)
+      {
+        s.overrun_window_ms = now;
+        s.overruns = 0;
+      }
+      if (++s.overruns >= kAutoOverruns)
+        s.auto_full_blocked.store(true, std::memory_order_release);
+    }
+  }
   if (fade_state == 0)
   {
     for (uint32_t ch = 0; ch < dsp_channels; ++ch)
@@ -3100,4 +3325,5 @@ extern "C" void nam_eng_init(const uint32_t* triples, uint32_t count, void* buil
                static_cast<unsigned long>(g_disp.eng_tab));
   spawn_detached([]() { display_watcher(); });
   nam_devctl_start();
+  quality::start();
 }
