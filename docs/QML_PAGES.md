@@ -64,6 +64,13 @@ INPUT (Level), OUTPUT (Tone), CALIBRATION (the Gain switch); Reverb: DECAY (Driv
 The tile captions are edited too (`EncoderParamInfo.qml`, table above): the tiles show MODEL / INPUT / OUTPUT / CALIB for NAM
 (the Gain tile's Low / High read OFF / ON) and DECAY / MIX / DAMPING for Reverb.
 
+## NAM: Lite / Full
+
+`nam_ui.qml` has LITE / FULL buttons under the parameters. They set the pedal's **Hi-Cut** switch (engine byte `0x57f`,
+On by default; its tile is hidden on NAM pedals, and the preset saves it): On = Lite, Off = Full. The hook reads that
+byte every block (`kEngQualityByte` in `patch/nam_hook.cpp`) and reloads the model at the other size when it changes.
+See docs/TECHNICAL.md, "CPU budget", for what Full costs.
+
 ## Reverb: algorithm selector
 
 `reverb_ui.qml` shows the algorithm and has PLATE / HALL / ROOM / SPRING buttons (Gain and Hi-Cut tiles are hidden). They set two switches the stock pedal

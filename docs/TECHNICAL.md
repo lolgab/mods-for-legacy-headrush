@@ -40,7 +40,16 @@ everything on the board. Measured on the Pedalboard with the NAM pedals:
   about **680 us** per channel for the large one and about **104 us** for the
   small one. Calibration picks the largest that fits a per-instance budget
   (`1000 us / running instances`, with a 50% safety margin) and in practice
-  always lands on the small one.
+  always lands on the small one. This is **NAM Lite**, the default.
+- **NAM Full** (the LITE / FULL buttons on a NAM pedal's detail page, stored
+  in its hidden Hi-Cut switch: On = Lite, Off = Full) skips the calibration
+  and always runs the large size; switching reloads the model with the same
+  duck-out / duck-in as a model change. One NAM on a mono input (dual mono, below: one model run) is ~680 us
+  of the 1000 us block, so it fits only **one active NAM** and only with the
+  HeadRush **Tails** setting **off**: with Tails on, a rig change keeps the
+  old rig running next to the new one, two NAMs at once. A stereo effect
+  before the NAM doubles the cost and overruns too. Non-A2 models are not
+  affected by Lite / Full. Not yet measured on hardware.
 - Each instance runs one model per channel. Run as two channels, an instance
   costs ~250 us per block, so **three active NAMs (~780 us) overran** while two
   (~520 us) did not; the symptom was crackle until a scene deactivated one.

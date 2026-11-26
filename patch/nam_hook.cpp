@@ -510,6 +510,14 @@ struct ModelState
   // could be mid-call on the very same object.
   std::unique_ptr<nam::DSP> pending_dsp[kMaxChannels];
   int pending_index = -1; // set before pending_ready; read only after
+  // NAM Lite / Full (A2 models only, see calibrate_slimmable_quality): want_full is the pedal's setting, written by
+  // the audio thread every block (additive NAM pedals: their Hi-Cut switch, set from the LITE / FULL buttons of
+  // ui/nam_ui.qml; Anxiety OD: always Lite). The loader reads it once per load and records what it built in
+  // pending_full (set before pending_ready, like pending_index); active_full is what is playing (audio thread only).
+  // A difference between the two sends the pedal through the same duck-out/reload/duck-in cycle as a model change.
+  std::atomic<bool> want_full{false};
+  bool pending_full = false;
+  bool active_full = false;
   std::atomic<bool> pending_ready{false};
   // 0=steady, 1=fading out the old model, 2=fading in the new one. Atomic
   // because switch_model_in_background (background thread) reads it to
@@ -724,6 +732,10 @@ int count_claimed_instances()
   return n;
 }
 
+// This is NAM Lite, the default. NAM Full (a pedal's FULL button, see ModelState::want_full) skips it and runs the
+// largest size: ~680 us per channel against a 1000 us block shared by the whole board, so it only fits one active NAM
+// on a mono input (dual mono runs one model, see nam_process_common), with the HeadRush "Tails" setting off (with Tails
+// on, a rig change keeps the old rig running next to the new one: two NAMs for a while).
 double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable)
 {
   const int concurrent_instances = std::max(1, count_claimed_instances());
@@ -830,6 +842,7 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
       } reset{s.switching};
 
       const int idx = knob_value_to_index(raw, static_cast<int>(g_cached_models.size()));
+      const bool full = s.want_full.load(std::memory_order_acquire);
       if (idx == -2 || (idx == s.active_index.load(std::memory_order_acquire) && !force_reload_same_model))
         return; // no files found at all, or knob moved but landed back on the same state
                 // (unless a forced recalibration deliberately wants this same model rebuilt)
@@ -843,6 +856,7 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
         for (int i = 0; i < kMaxChannels; ++i)
           s.pending_dsp[i].reset();
         s.pending_index = idx;
+        s.pending_full = full;
         s.pending_ready.store(true, std::memory_order_release);
         return;
       }
@@ -882,7 +896,14 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
           // internal sub-model reconstruction per tier tested) on every
           // single switch was pure avoidable churn once a model has already
           // been calibrated once.
-          if (i == 0)
+          if (i == 0 && full)
+          {
+            // NAM Full: the largest size, no calibration (see calibrate_slimmable_quality's comment for the cost)
+            chosen_ratio = 1.0;
+            slimmable->SetSlimmableSize(chosen_ratio);
+            std::fprintf(stderr, "[nam_load] model %d tier=full instances=%d\n", idx, count_claimed_instances());
+          }
+          else if (i == 0)
           {
             std::lock_guard<std::mutex> lock(g_calibration_cache_mutex);
             auto& entry = g_calibration_cache[static_cast<size_t>(idx)];
@@ -977,6 +998,7 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
       for (int i = 0; i < kMaxChannels; ++i)
         s.pending_dsp[i] = std::move(loaded[i]);
       s.pending_index = idx;
+      s.pending_full = full;
       s.pending_ready.store(true, std::memory_order_release);
     }
     catch (...)
@@ -1094,6 +1116,11 @@ float raised_cosine_ramp(int32_t progress, int32_t len)
 // Where the three knobs and the bypass byte live inside the hijacked engine object, plus how the trims are
 // curved. Anxiety OD's and the additive NAM pedals' engines (a Glorious Drive clone) have the same shape at
 // different offsets.
+// Additive NAM pedals: their Hi-Cut switch (a byte, On by default, saved with the preset; the stock tile is hidden on
+// NAM pedals) is the Lite / Full setting: On = Lite, Off = Full. ui/nam_ui.qml sets it from its LITE / FULL buttons.
+// The Reverb pedals use the same byte for their algorithm (default_reverb_algo) but never reach nam_process_common.
+constexpr uint32_t kEngQualityByte = 0x57f;
+
 struct KnobLayout
 {
   uint32_t model, input, output, bypass, hilo;
@@ -1251,6 +1278,8 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
   const float tone_raw = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(this_) + kl.input);   // input trim
   const float level_raw = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(this_) + kl.output); // output trim
   const uint8_t bypass_byte = *(reinterpret_cast<uint8_t*>(this_) + kl.bypass);
+  if (kl.db_trim) // additive NAM pedals only; Anxiety OD stays Lite
+    s.want_full.store(*(reinterpret_cast<uint8_t*>(this_) + kEngQualityByte) == 0, std::memory_order_release);
 
   // Bypass is checked further down now, right before the first place it
   // actually needs to change behavior (the produced audio) -- NOT here.
@@ -1339,8 +1368,14 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
     // switch_model_in_background's epoch-tagged cache check (see
     // CalibrationEntry) then recalculates its tier against the new,
     // smaller budget instead of reusing the stale cached one.
+    //
+    // The same cycle switches a pedal between NAM Lite and NAM Full (ModelState::want_full). A Full model doesn't
+    // depend on the budget, so a new instance joining doesn't reload it.
+    const bool quality_changed = s.active_full != s.want_full.load(std::memory_order_acquire);
+    const bool epoch_stale = !s.active_full
+                             && s.calibrated_epoch.load(std::memory_order_acquire) != g_topology_epoch.load(std::memory_order_acquire);
     if (s.fade_state.load(std::memory_order_relaxed) == 0 && s.active_index.load(std::memory_order_acquire) >= 0
-        && s.calibrated_epoch.load(std::memory_order_acquire) != g_topology_epoch.load(std::memory_order_acquire))
+        && (epoch_stale || quality_changed))
     {
       s.force_recalibrate = true;
       s.fade_state.store(1, std::memory_order_relaxed);
@@ -1402,6 +1437,7 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
       for (int i = 0; i < kMaxChannels; ++i)
         s.dsp[i] = std::move(s.pending_dsp[i]);
       s.active_index.store(s.pending_index, std::memory_order_release);
+      s.active_full = s.pending_full;
       s.pending_ready.store(false, std::memory_order_release);
       s.ready.store(true, std::memory_order_release);
       ready = true;
@@ -1416,6 +1452,7 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
       for (int i = 0; i < kMaxChannels; ++i)
         s.dsp[i] = std::move(s.pending_dsp[i]);
       s.active_index.store(s.pending_index, std::memory_order_release);
+      s.active_full = s.pending_full;
       s.pending_ready.store(false, std::memory_order_release);
       s.fade_progress = 0;
       s.fade_state.store(s.pending_index < 0 ? 0 : 2, std::memory_order_relaxed);

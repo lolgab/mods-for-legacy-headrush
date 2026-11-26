@@ -163,6 +163,22 @@ blocks on a board, so by default that's 2 NAM instances max, and Anxiety OD
 the same way, for up to 4 hijacked NAM instances total — at the cost of losing
 Anxiety OD V2's real sound board-wide too.
 
+## NAM Lite / NAM Full
+
+A2 models come in two sizes. **NAM Lite** (the default) runs the small one,
+cheap enough for several NAM pedals on one rig. **NAM Full** runs the full
+model, the same sound as on a computer, but it takes about two thirds of the
+board's CPU. Pick it per pedal with the **LITE** / **FULL** buttons on the NAM
+pedal's detail page (Pedalboard; it is saved with the preset). With Full:
+
+- use **one NAM at a time**, with a mono signal into it (no stereo effect
+  before it);
+- turn HeadRush's **Tails** setting **off**: with Tails on, a rig
+  change keeps the old rig running next to the new one, two NAMs at once,
+  which crackles.
+
+Other (non-A2) models sound the same either way. Not yet tested on hardware.
+
 ## Reverb pedals (optional, Pedalboard only, experimental)
 
 Tick **Also add the Reverb pedals** in the installer (or pass
