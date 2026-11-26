@@ -66,12 +66,13 @@ The tile captions are edited too (`EncoderParamInfo.qml`, table above): the tile
 
 ## NAM: quality (Auto / Lite / Full)
 
-`nam_ui.qml` has AUTO / LITE / FULL buttons under the parameters. They don't use a pedal switch: the mode is one
-setting for all NAM pedals, kept by the hook (docs/TECHNICAL.md, "CPU budget"). With no `XMLHttpRequest` the page
-can't call the hook, so a button sets an invisible `Image` to `file:///tmp/nam_mode/<auto|lite|full>.png?<time>`
-(an image is always read from disk; a QML file may be served from the QML disk cache) and the hook, watching that
-folder with inotify, sees which one was opened. The hook writes the current mode to `/tmp/nam_mode_state.qml`, which
-the page loads (with its own `?<time>`) when it opens and 400 ms after a click.
+`nam_ui.qml` has AUTO / LITE / FULL buttons under the parameters. They don't use a pedal switch: the hook keeps a
+mode per pedal name (docs/TECHNICAL.md, "CPU budget"). With no `XMLHttpRequest` the page can't call the hook, so a
+button sets an invisible `Image` to `file:///tmp/nam_mode/<pedal>-<auto|lite|full>.png?<time>` (the pedal name with
+spaces as `_`, e.g. `NAM_TWO_2-full.png`; an image is always read from disk, a QML file may be served from the QML
+disk cache) and the hook, watching that folder with inotify, sees which one was opened. The hook writes every pedal's
+mode to `/tmp/nam_mode_state.qml` (`modes: {"NAM": 0, "NAM 2": 2}`), which the page loads (with its own `?<time>`)
+when it opens and 400 ms after a click.
 
 ## Reverb: algorithm selector
 

@@ -69,6 +69,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <string>
+#include <poll.h>
 #include <sys/inotify.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -520,6 +521,8 @@ struct ModelState
   // the largest size in pending_mode / pending_full (set before pending_ready, like pending_index); active_mode /
   // active_full are what is playing (audio thread only). A mode other than the selected one sends the pedal through
   // the same duck-out/reload/duck-in cycle as a model change.
+  std::atomic<int> want_mode{0}; // the selected mode (quality::Mode), resolved by the audio thread every block
+  int seen_slot = -1;             // quality name slot this engine had last block (audio thread only)
   int pending_mode = -1;
   bool pending_full = false;
   int active_mode = -1;
@@ -748,8 +751,9 @@ int count_claimed_instances()
   return n;
 }
 
-// NAM quality: which size A2 models run at, picked on the NAM pedal's detail page (ui/nam_ui.qml), one mode for every
-// additive NAM pedal, kept across reboots in <model dir>/nam_quality.txt. A2 models measured here have two sizes,
+// NAM quality: which size A2 models run at, picked per pedal on its detail page (ui/nam_ui.qml) and kept across reboots
+// in <model dir>/nam_quality.txt ("NAM 2=full" lines). A pedal is known by its name ("NAM", "NAM 2", "NAM TWO",
+// "NAM TWO 2"), which nam_eng_record reads when the pedal's engine is created; an engine with no recorded name uses AUTO. A2 models measured here have two sizes,
 // ~104 us (Lite) and ~680 us (Full) per channel, against a 1000 us block shared by the whole board.
 //   AUTO  (default) calibrate: the largest size that fits 75% of 1000 us / active NAMs on a mono input, so one NAM gets
 //         Full and two get Lite; a new NAM joining recalibrates. While on Full a watchdog drops to Lite on a stereo
@@ -760,9 +764,9 @@ int count_claimed_instances()
 // Anxiety OD (the hijack) keeps the original rule (kLegacy): 2 channels, 50% margin, in practice always Lite.
 //
 // The page can't call into the hook (this Qt has no XMLHttpRequest) and can't write files: its buttons load a tiny
-// image, /tmp/nam_mode/<auto|lite|full>.png?<time>, and a thread here sees the open through inotify. An Image is used
-// rather than a QML file because the QML disk cache may skip reading a file it already compiled. The hook writes the
-// selection back as /tmp/nam_mode_state.qml for the page to show.
+// image, /tmp/nam_mode/<pedal name, spaces as _>-<auto|lite|full>.png?<time>, and a thread here sees the open through
+// inotify. An Image is used rather than a QML file because the QML disk cache may skip reading a file it already
+// compiled. The hook writes every pedal's mode back as /tmp/nam_mode_state.qml for the page to show.
 namespace quality
 {
 enum Mode : int
@@ -773,14 +777,36 @@ enum Mode : int
   kLegacy = 3, // Anxiety OD
 };
 const char* const kNames[3] = {"auto", "lite", "full"};
-std::atomic<int> g_mode{kAuto};
-std::atomic<int> g_gen{0}; // bumped on every selection, also of the mode already selected (AUTO again = retry Full)
 const char* const kDir = "/tmp/nam_mode";
 const char* const kState = "/tmp/nam_mode_state.qml";
+
+// One slot per pedal name. Slots are claimed by nam_eng_record (Evil's thread that creates pedals, never the audio
+// thread) and never released; the audio thread only reads `mode` / `gen`.
+constexpr int kMaxNames = 8;
+struct NameSlot
+{
+  char name[32] = {};
+  std::atomic<bool> used{false};
+  bool files = false;           // the trigger images exist (watcher thread only)
+  std::atomic<int> mode{kAuto};
+  std::atomic<int> gen{0};      // bumped on every selection, also of the mode already selected (AUTO again = retry Full)
+};
+NameSlot g_names[kMaxNames];
+std::mutex g_names_mutex;
+std::map<std::string, int> g_saved; // modes read from the file, for pedals not seen yet (under g_names_mutex)
+bool g_saved_loaded = false;
+std::atomic<bool> g_dirty{false}; // a slot was claimed: the watcher creates its images and rewrites the state file
 
 std::filesystem::path conf_path()
 {
   return model_dir() / "nam_quality.txt";
+}
+
+std::string file_key(const char* name)
+{
+  std::string k(name);
+  std::replace(k.begin(), k.end(), ' ', '_');
+  return k;
 }
 
 void write_file_atomically(const std::string& path, const std::string& text)
@@ -795,32 +821,107 @@ void write_file_atomically(const std::string& path, const std::string& text)
   std::fprintf(stderr, "[nam_mode] could not write %s: %s\n", path.c_str(), std::strerror(errno));
 }
 
-void write_state(int m)
+// caller holds g_names_mutex
+void load_saved_locked()
 {
-  write_file_atomically(kState, "import QtQuick 2.2\nQtObject { property int mode: " + std::to_string(m) + " }\n");
-}
-
-int load_saved()
-{
+  if (g_saved_loaded)
+    return;
+  g_saved_loaded = true;
   std::ifstream f(conf_path());
-  std::string word;
-  if (f >> word)
-    for (int i = 0; i < 3; ++i)
-      if (word == kNames[i])
-        return i;
-  return kAuto;
+  std::string line;
+  while (std::getline(f, line))
+  {
+    const auto eq = line.rfind('=');
+    if (eq == std::string::npos)
+      continue;
+    const std::string word = line.substr(eq + 1);
+    for (int m = 0; m < 3; ++m)
+      if (word == kNames[m])
+        g_saved[line.substr(0, eq)] = m;
+  }
 }
 
-void select(int m)
+// The slot of a pedal name (claimed on first sight, with its saved mode); -1 if the name is empty or every slot is taken.
+int slot_for_name(const char* name)
 {
-  g_mode.store(m, std::memory_order_release);
-  g_gen.fetch_add(1, std::memory_order_acq_rel);
-  write_state(m);
-  write_file_atomically(conf_path().string(), std::string(kNames[m]) + "\n");
-  std::fprintf(stderr, "[nam_mode] %s\n", kNames[m]);
+  if (!name[0])
+    return -1;
+  std::lock_guard<std::mutex> lock(g_names_mutex);
+  for (int i = 0; i < kMaxNames; ++i)
+    if (g_names[i].used.load(std::memory_order_acquire) && std::strcmp(g_names[i].name, name) == 0)
+      return i;
+  load_saved_locked();
+  for (int i = 0; i < kMaxNames; ++i)
+    if (!g_names[i].used.load(std::memory_order_acquire))
+    {
+      std::snprintf(g_names[i].name, sizeof(g_names[i].name), "%s", name);
+      const auto it = g_saved.find(name);
+      g_names[i].mode.store(it != g_saved.end() ? it->second : static_cast<int>(kAuto), std::memory_order_release);
+      g_names[i].used.store(true, std::memory_order_release);
+      g_dirty.store(true, std::memory_order_release);
+      return i;
+    }
+  return -1;
 }
 
-void watch()
+void write_state()
+{
+  std::string qml = "import QtQuick 2.2\nQtObject { property var modes: ({";
+  {
+    std::lock_guard<std::mutex> lock(g_names_mutex);
+    bool first = true;
+    for (const auto& n : g_names)
+      if (n.used.load(std::memory_order_acquire))
+      {
+        qml += std::string(first ? "" : ", ") + "\"" + n.name + "\": " + std::to_string(n.mode.load());
+        first = false;
+      }
+  }
+  qml += "}) }\n";
+  write_file_atomically(kState, qml);
+}
+
+void save()
+{
+  std::string text;
+  {
+    std::lock_guard<std::mutex> lock(g_names_mutex);
+    load_saved_locked();
+    for (const auto& n : g_names)
+      if (n.used.load(std::memory_order_acquire))
+        g_saved[n.name] = n.mode.load();
+    for (const auto& kv : g_saved) // pedals not on this board keep their mode too
+      text += kv.first + "=" + kNames[kv.second] + "\n";
+  }
+  write_file_atomically(conf_path().string(), text);
+}
+
+void select(int slot, int m)
+{
+  g_names[slot].mode.store(m, std::memory_order_release);
+  g_names[slot].gen.fetch_add(1, std::memory_order_acq_rel);
+  write_state();
+  save();
+  std::fprintf(stderr, "[nam_mode] %s: %s\n", g_names[slot].name, kNames[m]);
+}
+
+// "<key>-<mode>.png" -> select
+void on_open(const char* file)
+{
+  const std::string f(file);
+  const auto dash = f.rfind('-');
+  if (dash == std::string::npos || f.size() < 4 || f.compare(f.size() - 4, 4, ".png") != 0)
+    return;
+  const std::string key = f.substr(0, dash), word = f.substr(dash + 1, f.size() - 4 - dash - 1);
+  for (int m = 0; m < 3; ++m)
+    if (word == kNames[m])
+      for (int i = 0; i < kMaxNames; ++i)
+        if (g_names[i].used.load(std::memory_order_acquire) && file_key(g_names[i].name) == key)
+          select(i, m);
+}
+
+// creates the trigger images of newly claimed slots
+void publish_new_slots()
 {
   // 1x1 transparent PNG: what the page's Image loads
   static const unsigned char kPng[] = {
@@ -828,9 +929,24 @@ void watch()
     0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00,
     0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00, 0x00, 0x05, 0x00,
     0x01, 0x7a, 0x5e, 0xab, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
+  if (!g_dirty.exchange(false, std::memory_order_acq_rel))
+    return;
+  for (auto& n : g_names)
+    if (n.used.load(std::memory_order_acquire) && !n.files)
+    {
+      // the .tmp + rename write opens "<file>.tmp", which on_open ignores, never "<file>" itself
+      for (const char* m : kNames)
+        write_file_atomically(std::string(kDir) + "/" + file_key(n.name) + "-" + m + ".png",
+                              std::string(reinterpret_cast<const char*>(kPng), sizeof(kPng)));
+      n.files = true;
+      std::fprintf(stderr, "[nam_mode] pedal \"%s\": %s\n", n.name, kNames[n.mode.load()]);
+    }
+  write_state();
+}
+
+void watch()
+{
   ::mkdir(kDir, 0755);
-  for (const char* name : kNames)
-    write_file_atomically(std::string(kDir) + "/" + name + ".png", std::string(reinterpret_cast<const char*>(kPng), sizeof(kPng)));
   const int fd = inotify_init1(IN_CLOEXEC);
   if (fd < 0 || inotify_add_watch(fd, kDir, IN_OPEN) < 0)
   {
@@ -840,22 +956,25 @@ void watch()
   alignas(inotify_event) char buf[4096];
   for (;;)
   {
-    const ssize_t n = read(fd, buf, sizeof(buf));
-    if (n <= 0)
+    publish_new_slots();
+    pollfd p{fd, POLLIN, 0};
+    const int r = poll(&p, 1, 500);
+    if (r < 0 && errno != EINTR)
     {
-      if (n < 0 && errno == EINTR)
-        continue;
-      std::fprintf(stderr, "[nam_mode] inotify read ended: %s\n", std::strerror(errno));
+      std::fprintf(stderr, "[nam_mode] poll failed: %s\n", std::strerror(errno));
       return;
     }
-    for (char* p = buf; p < buf + n;)
+    if (r <= 0)
+      continue;
+    const ssize_t n = read(fd, buf, sizeof(buf));
+    if (n <= 0)
+      continue;
+    for (char* q = buf; q < buf + n;)
     {
-      const auto* ev = reinterpret_cast<const inotify_event*>(p);
+      const auto* ev = reinterpret_cast<const inotify_event*>(q);
       if (ev->len > 0)
-        for (int i = 0; i < 3; ++i)
-          if (std::string(ev->name) == std::string(kNames[i]) + ".png")
-            select(i);
-      p += sizeof(inotify_event) + ev->len;
+        on_open(ev->name);
+      q += sizeof(inotify_event) + ev->len;
     }
   }
 }
@@ -867,10 +986,8 @@ void start()
   bool expected = false;
   if (!started.compare_exchange_strong(expected, true))
     return;
-  const int m = load_saved();
-  g_mode.store(m, std::memory_order_release);
-  write_state(m);
-  std::fprintf(stderr, "[nam_mode] start: %s (%s)\n", kNames[m], conf_path().c_str());
+  g_dirty.store(true, std::memory_order_release); // pedals recorded before this still need their images
+  std::fprintf(stderr, "[nam_mode] start (%s)\n", conf_path().c_str());
   spawn_detached([]() { watch(); });
 }
 } // namespace quality
@@ -1017,8 +1134,7 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
       } reset{s.switching};
 
       const int idx = knob_value_to_index(raw, static_cast<int>(g_cached_models.size()));
-      const int mode = s.is_eng.load(std::memory_order_acquire) ? quality::g_mode.load(std::memory_order_acquire)
-                                                                 : static_cast<int>(quality::kLegacy);
+      const int mode = s.want_mode.load(std::memory_order_acquire);
       const bool no_full = s.auto_full_blocked.load(std::memory_order_acquire);
       if (idx == -2 || (idx == s.active_index.load(std::memory_order_acquire) && !force_reload_same_model))
         return; // no files found at all, or knob moved but landed back on the same state
@@ -1081,8 +1197,8 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
             chosen_ratio = mode == quality::kFull ? 1.0 : 0.0;
             slimmable->SetSlimmableSize(chosen_ratio);
             built_full = mode == quality::kFull && !slimmable->GetSlimmableSizeBreakpoints().empty();
-            std::fprintf(stderr, "[nam_load] model %d mode=%s tier=%.2f instances=%d\n", idx, quality::kNames[mode],
-                         chosen_ratio, count_claimed_instances());
+            std::fprintf(stderr, "[nam_load] %p model %d mode=%s tier=%.2f instances=%d\n", s.owner_this.load(), idx,
+                         quality::kNames[mode], chosen_ratio, count_claimed_instances());
           }
           else if (i == 0)
           {
@@ -1104,7 +1220,7 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
               slimmable->SetSlimmableSize(entry.ratio);
             chosen_ratio = entry.ratio;
             built_full = entry.top;
-            std::fprintf(stderr, "[nam_load] model %d mode=%s tier=%.2f%s instances=%d epoch=%d\n", idx,
+            std::fprintf(stderr, "[nam_load] %p model %d mode=%s tier=%.2f%s instances=%d epoch=%d\n", s.owner_this.load(), idx,
                          is_auto ? "auto" : "legacy", chosen_ratio, is_auto && no_full ? " (full blocked)" : "",
                          count_claimed_instances(), live_epoch);
           }
@@ -1389,6 +1505,7 @@ extern "C" void nam_process_gonk(void* this_, uint32_t /*param2*/, float** input
 // Level = dry/wet mix, Tone = damping (bright at 1). The Gain Low/High switch (byte 0x57c) picks the algorithm,
 // see default_reverb_algo(); the dev control channel (namespace devctl) can override everything.
 static bool eng_is_reverb(void* eng);
+static int eng_name_slot(void* eng);
 static void reverb_process(void* eng, float** input, uint32_t numChannels, float** output, int32_t numFrames);
 
 extern "C" void nam_process_eng(void* this_, uint32_t /*param2*/, float** input, uint32_t numChannels,
@@ -1462,6 +1579,12 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
   const float tone_raw = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(this_) + kl.input);   // input trim
   const float level_raw = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(this_) + kl.output); // output trim
   const uint8_t bypass_byte = *(reinterpret_cast<uint8_t*>(this_) + kl.bypass);
+  // NAM quality of this pedal (namespace quality): before any load starts, the loader reads it from want_mode
+  const int name_slot = kl.db_trim ? eng_name_slot(this_) : -1;
+  s.want_mode.store(!kl.db_trim     ? static_cast<int>(quality::kLegacy)
+                    : name_slot >= 0 ? quality::g_names[name_slot].mode.load(std::memory_order_acquire)
+                                     : static_cast<int>(quality::kAuto),
+                    std::memory_order_release);
 
   // Bypass is checked further down now, right before the first place it
   // actually needs to change behavior (the produced audio) -- NOT here.
@@ -1554,9 +1677,13 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
     // The same cycle applies the NAM quality mode (namespace quality): a new mode picked on the page, AUTO's watchdog
     // dropping Full, or AUTO picked again (retry Full). Only calibrated modes (AUTO, Anxiety OD) depend on the budget,
     // so only they reload when an instance joins.
-    const int want_mode = s.is_eng.load(std::memory_order_relaxed) ? quality::g_mode.load(std::memory_order_acquire)
-                                                                    : static_cast<int>(quality::kLegacy);
-    const int gen = quality::g_gen.load(std::memory_order_acquire);
+    const int want_mode = s.want_mode.load(std::memory_order_relaxed);
+    const int gen = name_slot >= 0 ? quality::g_names[name_slot].gen.load(std::memory_order_acquire) : 0;
+    if (name_slot != s.seen_slot) // first block, or the engine now belongs to another pedal: nothing to retry
+    {
+      s.seen_slot = name_slot;
+      s.seen_mode_gen = gen;
+    }
     if (gen != s.seen_mode_gen)
     {
       s.seen_mode_gen = gen;
@@ -2747,6 +2874,7 @@ struct EngKind
   std::atomic<int> reverb_slot{-2}; // -2 unresolved, -1 not a reverb, >= 0 index into g_reverbs
   int tries = 0;                    // resolution attempts so far (audio thread only)
   std::atomic<int> rec{-1};         // recorded at creation (nam_eng_record): -1 never, 0 NAM, 1 Reverb
+  std::atomic<int> name_slot{-1};   // quality::g_names slot of the pedal's name (nam_eng_record), -1 unknown
 };
 EngKind g_eng_kinds[kMaxEngKinds];
 reverb::Unit g_reverbs[kMaxReverbs]; // zero-initialised static storage, select() on first use
@@ -2830,6 +2958,16 @@ int engine_named_reverb(uintptr_t eng)
 }
 } // namespace
 
+// the quality name slot nam_eng_record found for this engine's pedal, -1 if none (audio thread: a few atomic loads)
+static int eng_name_slot(void* eng)
+{
+  const uintptr_t key = reinterpret_cast<uintptr_t>(eng);
+  for (int i = 0; i < kMaxEngKinds; ++i)
+    if (g_eng_kinds[i].eng.load(std::memory_order_acquire) == key)
+      return g_eng_kinds[i].name_slot.load(std::memory_order_acquire);
+  return -1;
+}
+
 static bool eng_is_reverb(void* eng)
 {
   const uintptr_t key = reinterpret_cast<uintptr_t>(eng);
@@ -2874,17 +3012,22 @@ static bool eng_is_reverb(void* eng)
 extern "C" void nam_eng_record(void* eng, const void* name)
 {
   bool reverb = false;
+  char text[32] = {}; // the pedal name, ASCII ("NAM 2"), empty if unreadable or too long
   uint32_t d = 0, size = 0, off = 0;
-  if (peek_u32(reinterpret_cast<uintptr_t>(name), &d) && peek_u32(d + 4, &size) && peek_u32(d + 12, &off) && size >= 6
-      && size <= 80)
+  if (peek_u32(reinterpret_cast<uintptr_t>(name), &d) && peek_u32(d + 4, &size) && peek_u32(d + 12, &off) && size >= 1
+      && size < sizeof(text))
   {
-    static const char kName[] = "Reverb";
-    reverb = true;
-    for (uint32_t k = 0; k < 6 && reverb; ++k)
+    for (uint32_t k = 0; k < size; ++k)
     {
       uint16_t c;
-      reverb = peek(d + off + 2 * k, &c, 2) && c == static_cast<uint16_t>(kName[k]);
+      if (!peek(d + off + 2 * k, &c, 2) || c < 0x20 || c > 0x7e)
+      {
+        text[0] = 0;
+        break;
+      }
+      text[k] = static_cast<char>(c);
     }
+    reverb = std::strncmp(text, "Reverb", 6) == 0;
   }
   const uintptr_t key = reinterpret_cast<uintptr_t>(eng);
   EngKind* k = nullptr;
@@ -2906,7 +3049,8 @@ extern "C" void nam_eng_record(void* eng, const void* name)
   free_unit(k->reverb_slot.exchange(-2, std::memory_order_acq_rel));
   k->tries = 0;
   k->rec.store(reverb ? 1 : 0, std::memory_order_release);
-  std::fprintf(stderr, "[nam_eng] record engine %p name size %u -> %s\n", eng, size, reverb ? "Reverb" : "other");
+  k->name_slot.store(reverb ? -1 : quality::slot_for_name(text), std::memory_order_release);
+  std::fprintf(stderr, "[nam_eng] record engine %p name \"%s\" -> %s\n", eng, text, reverb ? "Reverb" : "other");
 }
 
 // Which algorithm a Reverb pedal runs when nothing overrides it. Two switches that the stock pedal already saves with

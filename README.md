@@ -167,12 +167,14 @@ Anxiety OD V2's real sound board-wide too.
 
 A2 models come in two sizes: a small one (Lite, cheap enough for several NAM
 pedals on one rig) and the full one (the same sound as on a computer, about two
-thirds of the board's CPU). Pick how the NAM pedals use them with the
-**AUTO** / **LITE** / **FULL** buttons on a NAM pedal's detail page
-(Pedalboard). The choice applies to every NAM pedal and is kept across reboots.
+thirds of the board's CPU). Pick how each NAM pedal uses them with the
+**AUTO** / **LITE** / **FULL** buttons on its detail page (Pedalboard): one
+pedal can run Full while the others run Lite. The choice belongs to the pedal
+("NAM", "NAM 2", "NAM TWO", "NAM TWO 2"), not to a rig, and is kept across
+reboots.
 
-- **AUTO** (default): Full when it fits, Lite otherwise. One NAM on a mono
-  signal gets Full; adding a second NAM switches them to Lite. If a Full pedal
+- **AUTO** (default): Full when it fits, Lite otherwise. A single NAM on a
+  mono signal gets Full; with two or more NAMs running, AUTO pedals get Lite. If a Full pedal
   then gets a stereo signal or runs out of CPU, it drops to Lite; press AUTO
   again to retry Full.
 - **LITE**: always the small size. No measuring and no reload when NAM pedals

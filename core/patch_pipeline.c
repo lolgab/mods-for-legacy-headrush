@@ -271,7 +271,8 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
     memset(grown + evil_len, 0, 4096);
     evil_data = grown;
     evil_len += 4096;
-    /* every pair shares the NAM engine class; the hook tells the Reverb one apart by its pedal name ("Reverb...") */
+    /* every pair shares the NAM engine class; the hook tells pedals apart by name (the Reverb pair; each NAM pedal's
+     * own quality mode): the engine stub records (engine, &name) when a pedal is created (record hook, always on) */
     const NamPair pairs[3] = {{"NAM", "NAM", NAM_ENGINE_TYPE, 0},
                               {"NAM TWO", "NAM TWO", NAM_ENGINE_TYPE, 0},
                               {"Reverb", "Reverb", NAM_ENGINE_TYPE, 0, NAM_CAT_REVERB}};
@@ -279,7 +280,7 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
     if (!nam_elf_patch_registry(evil_data, evil_len, pairs, npairs, err, err_size)
         || !nam_elf_patch_node_registration(evil_data, evil_len, pairs, npairs, &eng_init_slot, &eng_tab, err,
                                             err_size)
-        || !nam_elf_patch_engine_class(evil_data, evil_len, 2 * npairs, eng_tab, reverb_pedal, &eng_hook_slot, err, err_size))
+        || !nam_elf_patch_engine_class(evil_data, evil_len, 2 * npairs, eng_tab, true, &eng_hook_slot, err, err_size))
       goto cleanup;
     report(progress, progress_user_data,
            "OK  NAM pedals registered: \"NAM\" and \"NAM TWO\" (2 instances each), engine hook_slot @ 0x%x",
@@ -326,7 +327,7 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
     snprintf(hook_slot_v2_hex, sizeof(hook_slot_v2_hex), "0x%x", elf_result_v2.hook_slot_addr);
   if (!nam_build_launcher_script(script_data, anxiety_hijack ? hook_slot_hex : NULL, has_v2_hijack ? hook_slot_v2_hex : NULL,
                                   nam_pedals ? hook_slot_eng_hex : NULL, nam_pedals ? eng_init_hex : NULL,
-                                  nam_pedals ? eng_tab_hex : NULL, reverb_pedal, &new_script, err, err_size))
+                                  nam_pedals ? eng_tab_hex : NULL, nam_pedals, &new_script, err, err_size))
     goto cleanup;
   free(script_data);
   script_data = NULL;

@@ -26,20 +26,20 @@ Column {
 	property string calibText: gain && gain.translator ? (gain.translator.index === 1 ? "ON" : "OFF") : ""
 	property string expected: idx >= 0 ? Math.round(raw) + " " + names[idx] : ""
 
-	// NAM quality, one mode for every NAM pedal (namespace quality in nam_hook.cpp). This Qt has no XMLHttpRequest:
-	// a button loads /tmp/nam_mode/<mode>.png and the hook sees the file being opened; the hook writes the current
-	// mode to /tmp/nam_mode_state.qml.
+	// NAM quality of this pedal (namespace quality in nam_hook.cpp). This Qt has no XMLHttpRequest: a button loads
+	// /tmp/nam_mode/<pedal, spaces as _>-<mode>.png and the hook sees the file being opened; the hook writes every
+	// pedal's mode to /tmp/nam_mode_state.qml. A pedal the hook doesn't know yet reads as AUTO.
 	readonly property var qualityFiles: ["auto", "lite", "full"]
 	readonly property var qualityNames: ["AUTO", "LITE", "FULL"]
 	readonly property var qualityNotes: ["Full when it fits", "fast rig changes", "1 NAM, Tails off"]
-	property int quality: modeState.item ? modeState.item.mode : -1
+	property int quality: modeState.item && pedal !== "" && modeState.item.modes[pedal] !== undefined ? modeState.item.modes[pedal] : 0
 	property string trigger: ""
 	property double modeStamp: new Date().getTime()
 	Loader { id: modeState; source: "file:///tmp/nam_mode_state.qml?" + root.modeStamp }
 	Image { width: 1; height: 1; opacity: 0; cache: false; source: root.trigger }
 	Timer { id: modeRefresh; interval: 400; onTriggered: root.modeStamp = new Date().getTime() }
 	function chooseQuality(q) {
-		trigger = "file:///tmp/nam_mode/" + qualityFiles[q] + ".png?" + new Date().getTime()
+		trigger = "file:///tmp/nam_mode/" + pedal.replace(/ /g, "_") + "-" + qualityFiles[q] + ".png?" + new Date().getTime()
 		modeRefresh.restart()
 	}
 

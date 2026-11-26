@@ -43,8 +43,12 @@ everything on the board. Measured on the Pedalboard with the NAM pedals:
   always lands on the small one. This is the original rule, still used for
   Anxiety OD.
 - **NAM quality** (AUTO / LITE / FULL buttons on a NAM pedal's detail page,
-  one mode for all NAM pedals, saved in `<model dir>/nam_quality.txt`; see
-  `namespace quality` in `patch/nam_hook.cpp`). Anxiety OD keeps the rule
+  one mode per pedal name, saved in `<model dir>/nam_quality.txt` as
+  `NAM 2=full` lines; see `namespace quality` in `patch/nam_hook.cpp`). The
+  hook knows an engine's pedal name from `nam_eng_record`, which the engine
+  stub calls when a pedal is created (the record hook, installed in every
+  build with the NAM pedals; the older `{engine, &name}` table pointed at a
+  temporary and can't be used); an engine with no recorded name runs AUTO. Anxiety OD keeps the rule
   above. **AUTO** calibrates with 1 channel (the dual-mono case below) and a
   75% margin, so a single NAM gets Full (~680 us) and two get Lite; while on
   Full, a watchdog drops it to Lite after ~50 ms of stereo input or 3 blocks
@@ -53,8 +57,9 @@ everything on the board. Measured on the Pedalboard with the NAM pedals:
   joins. Full fits one active NAM on a mono input with Tails **off** (with
   Tails on, a rig change keeps the old rig running: two NAMs at once). The
   page talks to the hook through files: a button loads
-  `/tmp/nam_mode/<mode>.png` (the hook watches the opens with inotify) and the
-  hook writes `/tmp/nam_mode_state.qml` back. `patch/test_nam_quality.c`
+  `/tmp/nam_mode/<pedal, spaces as _>-<mode>.png` (the hook watches the opens
+  with inotify) and the hook writes every pedal's mode to
+  `/tmp/nam_mode_state.qml`. `patch/test_nam_quality.c`
   exercises it all on ARM. Not yet measured on hardware.
 - Each instance runs one model per channel. Run as two channels, an instance
   costs ~250 us per block, so **three active NAMs (~780 us) overran** while two
