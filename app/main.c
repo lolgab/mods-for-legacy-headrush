@@ -881,6 +881,245 @@ static void render_library_screen(struct nk_context* ctx, AppShared* shared, Lib
   }
 }
 
+#define WINDOW_TITLE "NAM Mod Installer for HeadRush"
+
+/* Everything one frame of the UI needs, so a frame can also be drawn from the resize event watch. */
+typedef struct
+{
+  SDL_Window* win;
+  SDL_Renderer* renderer;
+  struct nk_context* ctx;
+  AppShared* shared;
+  LibraryState* lib;
+  SDL_Thread** worker_thread;
+  bool in_events; /* between nk_input_begin and nk_input_end in the main loop */
+  bool drawing;   /* guards against a resize event raised while a frame is being drawn */
+} Gui;
+
+static void draw_frame(Gui* g)
+{
+  struct nk_context* ctx = g->ctx;
+  SDL_Renderer* renderer = g->renderer;
+  AppShared* shared = g->shared;
+  LibraryState* lib = g->lib;
+  g->drawing = true;
+
+  /* the panel fills the window; nk_begin only takes the rect on the first frame, so resize it every frame */
+  int w, h;
+  SDL_GetWindowSize(g->win, &w, &h);
+  nk_window_set_bounds(ctx, WINDOW_TITLE, nk_rect(0, 0, (float)w, (float)h));
+
+  SDL_LockMutex(shared->mutex);
+  AppState state = shared->state;
+  SDL_UnlockMutex(shared->mutex);
+
+  if (nk_begin(ctx, WINDOW_TITLE, nk_rect(0, 0, (float)w, (float)h), NK_WINDOW_NO_SCROLLBAR))
+  {
+    if (state == APP_STATE_PICK)
+    {
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label(ctx, "Unofficial: not affiliated with or endorsed by inMusic/HeadRush.", NK_TEXT_LEFT);
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label(ctx, "Downloads the official updater and patches your copy of it.", NK_TEXT_LEFT);
+
+      nk_layout_row_dynamic(ctx, 30, 1);
+      for (int i = 0; i < NAM_MODEL_COUNT; ++i)
+      {
+        int selected = (shared->selected_model == i);
+        if (nk_option_label(ctx, NAM_MODEL_TARGETS[i].name, selected) && !selected)
+          shared->selected_model = i;
+      }
+
+      const bool pedalboard = strcmp(NAM_MODEL_TARGETS[shared->selected_model].name, "pedalboard") == 0;
+      if (pedalboard)
+      {
+        nk_layout_row_dynamic(ctx, 28, 1);
+        nk_checkbox_label(ctx, "Add the NAM pedals (\"NAM\", \"NAM TWO\": four per rig)",
+                          &shared->add_nam_pedals);
+        nk_layout_row_dynamic(ctx, 28, 1);
+        if (shared->add_nam_pedals)
+          nk_checkbox_label(ctx, "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\"; untested on hardware)",
+                            &shared->add_reverb_pedals);
+        else
+        {
+          shared->add_reverb_pedals = 0;
+          nk_label(ctx, "Reverb pedals: need the NAM pedals", NK_TEXT_LEFT);
+        }
+        nk_layout_row_dynamic(ctx, 28, 1);
+        nk_checkbox_label(ctx, "Also make Anxiety OD run NAM (keeps your existing pedalboards working)",
+                          &shared->anxiety_hijack);
+      }
+      else
+      {
+        shared->add_nam_pedals = 0;
+        shared->add_reverb_pedals = 0;
+        shared->anxiety_hijack = 1;
+        nk_layout_row_dynamic(ctx, 24, 1);
+        nk_label(ctx, "This model has no NAM pedals yet: Anxiety OD runs NAM.", NK_TEXT_LEFT);
+      }
+
+      if (shared->anxiety_hijack)
+      {
+        nk_layout_row_dynamic(ctx, 28, 2);
+        int two = !shared->enable_v2_hijack;
+        if (nk_option_label(ctx, "2 Anxiety OD instances", two) && !two)
+          shared->enable_v2_hijack = false;
+        int four = shared->enable_v2_hijack;
+        if (nk_option_label(ctx, "Up to 4 (also Anxiety OD V2)", four) && !four)
+          shared->enable_v2_hijack = true;
+      }
+
+      nk_layout_row_dynamic(ctx, 28, 1);
+      if (pedalboard)
+        nk_checkbox_label(ctx, "Footswitch page-turner (FS5/FS11 -> USB Page Down/Up)", &shared->enable_page_pedal);
+      else
+      {
+        shared->enable_page_pedal = 0;
+        nk_label(ctx, "Footswitch page-turner: Pedalboard only", NK_TEXT_LEFT);
+      }
+
+      nk_layout_row_dynamic(ctx, 28, 1);
+      nk_checkbox_label(ctx, "I own this device and accept the risk (may brick it, voids warranty)",
+                        &shared->accepted_risk);
+
+      const bool nothing_selected = pedalboard && !shared->add_nam_pedals && !shared->anxiety_hijack;
+      if (nothing_selected)
+      {
+        nk_layout_row_dynamic(ctx, 20, 1);
+        nk_label(ctx, "Select the NAM pedals and/or the Anxiety OD option.", NK_TEXT_LEFT);
+      }
+
+      nk_layout_row_dynamic(ctx, 40, 1);
+      if (nk_button_label(ctx, "Install NAM Mod") && !nothing_selected && shared->accepted_risk)
+      {
+        SDL_LockMutex(shared->mutex);
+        shared->state = APP_STATE_RUNNING;
+        shared->log_count = 0;
+        shared->cancel_requested = false;
+        SDL_UnlockMutex(shared->mutex);
+        *g->worker_thread = SDL_CreateThread(worker_main, "nam-worker", shared);
+      }
+
+      nk_layout_row_dynamic(ctx, 30, 1);
+      if (nk_button_label(ctx, "Prepare NAM Library..."))
+      {
+        lib->error_msg[0] = '\0';
+        library_detect_drive(lib);
+        SDL_LockMutex(shared->mutex);
+        shared->state = APP_STATE_LIBRARY;
+        SDL_UnlockMutex(shared->mutex);
+      }
+    }
+    else if (state == APP_STATE_LIBRARY)
+    {
+      render_library_screen(ctx, shared, lib);
+    }
+    else if (state == APP_STATE_RUNNING)
+    {
+      SDL_LockMutex(shared->mutex);
+      bool downloading = shared->downloading;
+      uint64_t dl_downloaded = shared->dl_downloaded, dl_total = shared->dl_total;
+      int log_count = shared->log_count;
+      char lines[MAX_LOG_LINES][256];
+      memcpy(lines, shared->log_lines, sizeof(lines));
+      SDL_UnlockMutex(shared->mutex);
+
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label(ctx, "Working...", NK_TEXT_LEFT);
+
+      if (downloading && dl_total > 0)
+      {
+        nk_layout_row_dynamic(ctx, 24, 1);
+        size_t prog = (size_t)((dl_downloaded * 100) / dl_total);
+        nk_size prog_sz = (nk_size)prog;
+        nk_progress(ctx, &prog_sz, 100, NK_FIXED);
+      }
+
+      nk_layout_row_dynamic(ctx, 260, 1);
+      if (nk_group_begin(ctx, "log", NK_WINDOW_BORDER))
+      {
+        nk_layout_row_dynamic(ctx, 18, 1);
+        for (int i = 0; i < log_count; ++i)
+          nk_label(ctx, lines[i], NK_TEXT_LEFT);
+        nk_group_end(ctx);
+      }
+    }
+    else if (state == APP_STATE_DONE)
+    {
+      char path[900];
+      SDL_LockMutex(shared->mutex);
+      snprintf(path, sizeof(path), "%s", shared->output_path);
+      SDL_UnlockMutex(shared->mutex);
+
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label(ctx, "Done! NAM mod applied.", NK_TEXT_LEFT);
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label(ctx, "Wrote:", NK_TEXT_LEFT);
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label(ctx, path, NK_TEXT_LEFT);
+      nk_layout_row_dynamic(ctx, 24, 1);
+#if defined(__APPLE__) || defined(_WIN32)
+      nk_label(ctx, "Run this like the official updater, with your device in", NK_TEXT_LEFT);
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label(ctx, "firmware-update mode.", NK_TEXT_LEFT);
+#else
+      nk_label(ctx, "Flash this file the same way you'd flash the stock Update.img", NK_TEXT_LEFT);
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label(ctx, "on your device (device must be in firmware-update mode).", NK_TEXT_LEFT);
+#endif
+      nk_layout_row_dynamic(ctx, 30, 2);
+      if (nk_button_label(ctx, "Open"))
+        nam_open_path(path);
+      if (nk_button_label(ctx, "Open in Folder"))
+        nam_reveal_path(path);
+    }
+    else /* APP_STATE_ERROR */
+    {
+      char errmsg[1024];
+      SDL_LockMutex(shared->mutex);
+      snprintf(errmsg, sizeof(errmsg), "%s", shared->error_msg);
+      SDL_UnlockMutex(shared->mutex);
+
+      nk_layout_row_dynamic(ctx, 24, 1);
+      nk_label_colored(ctx, "Something went wrong:", NK_TEXT_LEFT, nk_rgb(220, 60, 60));
+      nk_layout_row_dynamic(ctx, 80, 1);
+      nk_label_wrap(ctx, errmsg);
+      nk_layout_row_dynamic(ctx, 40, 1);
+      if (nk_button_label(ctx, "Try Again"))
+      {
+        SDL_LockMutex(shared->mutex);
+        shared->state = APP_STATE_PICK;
+        SDL_UnlockMutex(shared->mutex);
+      }
+    }
+  }
+  nk_end(ctx);
+
+  SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
+  SDL_RenderClear(renderer);
+  nk_sdl_render(NK_ANTI_ALIASING_ON);
+  SDL_RenderPresent(renderer);
+  g->drawing = false;
+}
+
+/* On macOS (and Windows) a live resize runs the OS's own modal loop inside SDL_PollEvent, which only returns when
+ * the mouse is released: the main loop draws nothing meanwhile, so the window shows the last frame stretched. SDL
+ * still calls event watches from inside that loop, so draw from here while the size changes. */
+static int SDLCALL resize_watch(void* data, SDL_Event* evt)
+{
+  Gui* g = (Gui*)data;
+  if (evt->type != SDL_WINDOWEVENT || g->drawing)
+    return 0;
+  if (evt->window.event != SDL_WINDOWEVENT_SIZE_CHANGED && evt->window.event != SDL_WINDOWEVENT_EXPOSED)
+    return 0;
+  if (g->in_events) /* keep nuklear's input bracket balanced: close it for this frame, reopen it after */
+    nk_input_end(g->ctx);
+  draw_frame(g);
+  if (g->in_events)
+    nk_input_begin(g->ctx);
+  return 0;
+}
+
 int main(int argc, char** argv)
 {
   (void)argc;
@@ -894,8 +1133,9 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  SDL_Window* win = SDL_CreateWindow("NAM Mod Installer for HeadRush", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                      640, 480, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+  SDL_Window* win = SDL_CreateWindow(WINDOW_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480,
+                                     SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+  SDL_SetWindowMinimumSize(win, 640, 480); /* the layout has fixed row heights and no scrollbar: never smaller */
   SDL_Renderer* renderer = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
   struct nk_context* ctx = nk_sdl_init(win, renderer);
@@ -920,208 +1160,24 @@ int main(int argc, char** argv)
   SDL_Thread* worker_thread = NULL;
   bool running = true;
 
+  Gui gui = {win, renderer, ctx, &shared, &lib, &worker_thread, false, false};
+  SDL_AddEventWatch(resize_watch, &gui);
+
   while (running)
   {
     SDL_Event evt;
     nk_input_begin(ctx);
+    gui.in_events = true;
     while (SDL_PollEvent(&evt))
     {
       if (evt.type == SDL_QUIT)
         running = false;
       nk_sdl_handle_event(&evt);
     }
+    gui.in_events = false;
     nk_input_end(ctx);
 
-    SDL_LockMutex(shared.mutex);
-    AppState state = shared.state;
-    SDL_UnlockMutex(shared.mutex);
-
-    if (nk_begin(ctx, "NAM Mod Installer for HeadRush", nk_rect(0, 0, 640, 480), NK_WINDOW_NO_SCROLLBAR))
-    {
-      if (state == APP_STATE_PICK)
-      {
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label(ctx, "Unofficial: not affiliated with or endorsed by inMusic/HeadRush.", NK_TEXT_LEFT);
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label(ctx, "Downloads the official updater and patches your copy of it.", NK_TEXT_LEFT);
-
-        nk_layout_row_dynamic(ctx, 30, 1);
-        for (int i = 0; i < NAM_MODEL_COUNT; ++i)
-        {
-          int selected = (shared.selected_model == i);
-          if (nk_option_label(ctx, NAM_MODEL_TARGETS[i].name, selected) && !selected)
-            shared.selected_model = i;
-        }
-
-        const bool pedalboard = strcmp(NAM_MODEL_TARGETS[shared.selected_model].name, "pedalboard") == 0;
-        if (pedalboard)
-        {
-          nk_layout_row_dynamic(ctx, 28, 1);
-          nk_checkbox_label(ctx, "Add the NAM pedals (\"NAM\", \"NAM TWO\": four per rig)",
-                            &shared.add_nam_pedals);
-          nk_layout_row_dynamic(ctx, 28, 1);
-          if (shared.add_nam_pedals)
-            nk_checkbox_label(ctx, "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\"; untested on hardware)",
-                              &shared.add_reverb_pedals);
-          else
-          {
-            shared.add_reverb_pedals = 0;
-            nk_label(ctx, "Reverb pedals: need the NAM pedals", NK_TEXT_LEFT);
-          }
-          nk_layout_row_dynamic(ctx, 28, 1);
-          nk_checkbox_label(ctx, "Also make Anxiety OD run NAM (keeps your existing pedalboards working)",
-                            &shared.anxiety_hijack);
-        }
-        else
-        {
-          shared.add_nam_pedals = 0;
-          shared.add_reverb_pedals = 0;
-          shared.anxiety_hijack = 1;
-          nk_layout_row_dynamic(ctx, 24, 1);
-          nk_label(ctx, "This model has no NAM pedals yet: Anxiety OD runs NAM.", NK_TEXT_LEFT);
-        }
-
-        if (shared.anxiety_hijack)
-        {
-          nk_layout_row_dynamic(ctx, 28, 2);
-          int two = !shared.enable_v2_hijack;
-          if (nk_option_label(ctx, "2 Anxiety OD instances", two) && !two)
-            shared.enable_v2_hijack = false;
-          int four = shared.enable_v2_hijack;
-          if (nk_option_label(ctx, "Up to 4 (also Anxiety OD V2)", four) && !four)
-            shared.enable_v2_hijack = true;
-        }
-
-        nk_layout_row_dynamic(ctx, 28, 1);
-        if (pedalboard)
-          nk_checkbox_label(ctx, "Footswitch page-turner (FS5/FS11 -> USB Page Down/Up)", &shared.enable_page_pedal);
-        else
-        {
-          shared.enable_page_pedal = 0;
-          nk_label(ctx, "Footswitch page-turner: Pedalboard only", NK_TEXT_LEFT);
-        }
-
-        nk_layout_row_dynamic(ctx, 28, 1);
-        nk_checkbox_label(ctx, "I own this device and accept the risk (may brick it, voids warranty)",
-                          &shared.accepted_risk);
-
-        const bool nothing_selected = pedalboard && !shared.add_nam_pedals && !shared.anxiety_hijack;
-        if (nothing_selected)
-        {
-          nk_layout_row_dynamic(ctx, 20, 1);
-          nk_label(ctx, "Select the NAM pedals and/or the Anxiety OD option.", NK_TEXT_LEFT);
-        }
-
-        nk_layout_row_dynamic(ctx, 40, 1);
-        if (nk_button_label(ctx, "Install NAM Mod") && !nothing_selected && shared.accepted_risk)
-        {
-          SDL_LockMutex(shared.mutex);
-          shared.state = APP_STATE_RUNNING;
-          shared.log_count = 0;
-          shared.cancel_requested = false;
-          SDL_UnlockMutex(shared.mutex);
-          worker_thread = SDL_CreateThread(worker_main, "nam-worker", &shared);
-        }
-
-        nk_layout_row_dynamic(ctx, 30, 1);
-        if (nk_button_label(ctx, "Prepare NAM Library..."))
-        {
-          lib.error_msg[0] = '\0';
-          library_detect_drive(&lib);
-          SDL_LockMutex(shared.mutex);
-          shared.state = APP_STATE_LIBRARY;
-          SDL_UnlockMutex(shared.mutex);
-        }
-      }
-      else if (state == APP_STATE_LIBRARY)
-      {
-        render_library_screen(ctx, &shared, &lib);
-      }
-      else if (state == APP_STATE_RUNNING)
-      {
-        SDL_LockMutex(shared.mutex);
-        bool downloading = shared.downloading;
-        uint64_t dl_downloaded = shared.dl_downloaded, dl_total = shared.dl_total;
-        int log_count = shared.log_count;
-        char lines[MAX_LOG_LINES][256];
-        memcpy(lines, shared.log_lines, sizeof(lines));
-        SDL_UnlockMutex(shared.mutex);
-
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label(ctx, "Working...", NK_TEXT_LEFT);
-
-        if (downloading && dl_total > 0)
-        {
-          nk_layout_row_dynamic(ctx, 24, 1);
-          size_t prog = (size_t)((dl_downloaded * 100) / dl_total);
-          nk_size prog_sz = (nk_size)prog;
-          nk_progress(ctx, &prog_sz, 100, NK_FIXED);
-        }
-
-        nk_layout_row_dynamic(ctx, 260, 1);
-        if (nk_group_begin(ctx, "log", NK_WINDOW_BORDER))
-        {
-          nk_layout_row_dynamic(ctx, 18, 1);
-          for (int i = 0; i < log_count; ++i)
-            nk_label(ctx, lines[i], NK_TEXT_LEFT);
-          nk_group_end(ctx);
-        }
-      }
-      else if (state == APP_STATE_DONE)
-      {
-        char path[900];
-        SDL_LockMutex(shared.mutex);
-        snprintf(path, sizeof(path), "%s", shared.output_path);
-        SDL_UnlockMutex(shared.mutex);
-
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label(ctx, "Done! NAM mod applied.", NK_TEXT_LEFT);
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label(ctx, "Wrote:", NK_TEXT_LEFT);
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label(ctx, path, NK_TEXT_LEFT);
-        nk_layout_row_dynamic(ctx, 24, 1);
-#if defined(__APPLE__) || defined(_WIN32)
-        nk_label(ctx, "Run this like the official updater, with your device in", NK_TEXT_LEFT);
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label(ctx, "firmware-update mode.", NK_TEXT_LEFT);
-#else
-        nk_label(ctx, "Flash this file the same way you'd flash the stock Update.img", NK_TEXT_LEFT);
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label(ctx, "on your device (device must be in firmware-update mode).", NK_TEXT_LEFT);
-#endif
-        nk_layout_row_dynamic(ctx, 30, 2);
-        if (nk_button_label(ctx, "Open"))
-          nam_open_path(path);
-        if (nk_button_label(ctx, "Open in Folder"))
-          nam_reveal_path(path);
-      }
-      else /* APP_STATE_ERROR */
-      {
-        char errmsg[1024];
-        SDL_LockMutex(shared.mutex);
-        snprintf(errmsg, sizeof(errmsg), "%s", shared.error_msg);
-        SDL_UnlockMutex(shared.mutex);
-
-        nk_layout_row_dynamic(ctx, 24, 1);
-        nk_label_colored(ctx, "Something went wrong:", NK_TEXT_LEFT, nk_rgb(220, 60, 60));
-        nk_layout_row_dynamic(ctx, 80, 1);
-        nk_label_wrap(ctx, errmsg);
-        nk_layout_row_dynamic(ctx, 40, 1);
-        if (nk_button_label(ctx, "Try Again"))
-        {
-          SDL_LockMutex(shared.mutex);
-          shared.state = APP_STATE_PICK;
-          SDL_UnlockMutex(shared.mutex);
-        }
-      }
-    }
-    nk_end(ctx);
-
-    SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
-    SDL_RenderClear(renderer);
-    nk_sdl_render(NK_ANTI_ALIASING_ON);
-    SDL_RenderPresent(renderer);
+    draw_frame(&gui);
   }
 
   if (worker_thread)
@@ -1133,6 +1189,7 @@ int main(int argc, char** argv)
   }
   SDL_DestroyMutex(shared.mutex);
 
+  SDL_DelEventWatch(resize_watch, &gui);
   nk_sdl_shutdown();
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(win);
