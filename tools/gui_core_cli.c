@@ -195,6 +195,6 @@ int main(int argc, char** argv)
     printf("%sOK  Anxiety OD (v1)%s process() NAM hijack applied.\n", opts.nam_pedals ? "" : "\n",
            opts.anxiety_v2 ? " + Anxiety OD V2" : "");
   if (page_pedal)
-    printf("OK  Footswitch page-turner installed (FS5/FS11 -> USB Page Down/Up, see docs/PAGE_PEDAL.md).\n");
+    printf("OK  Footswitch page-turner installed (FS5/FS11 -> USB Page Up/Down, see docs/PAGE_PEDAL.md).\n");
   return 0;
 }

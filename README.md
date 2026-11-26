@@ -176,13 +176,12 @@ hardware**: keep the `(stock)` updater handy — see
 
 Tick **Footswitch page-turner** in the installer (or pass `--page-pedal` to
 the CLI) and the Pedalboard also acts as a USB keyboard for the computer it's
-plugged into: the 5th footswitch from the left, **upper** row = **Page Down**,
-**lower** row = **Page Up**, for turning pages in a PDF. Leave those two
-switches unassigned in the HeadRush UI. The two switches light up (Page Down
-blue, Page Up white) and their small screens read **PAGE DOWN** / **PAGE UP**.
-The upper/lower numbering is a guess until confirmed on hardware, and there's a
-built-in calibration mode (and `--page-down-note` / `--page-up-note` to move the
-labels) — see [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md).
+plugged into: the 5th footswitch from the left, **upper** row = **Page Up**,
+**lower** row = **Page Down**, for turning pages in a PDF. Leave those two
+switches unassigned in the HeadRush UI. Both switches light up light blue and
+their small screens read **PAGE UP** / **PAGE DOWN**. To put the keys on other
+switches there's a calibration mode (and `--page-down-note` / `--page-up-note`
+to move the labels) — see [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md).
 
 ## Supported models
 

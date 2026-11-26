@@ -24,7 +24,7 @@ typedef void (*NamProgressFn)(const char* message, void* user_data);
  * separate Anxiety OD V2 does too (up to 4 hijacked instances in all). Both can be on together. The other models
  * (MX5, Gigboard) have no additive support yet, so for them `anxiety_hijack` is the only option and must be set.
  * `page_pedal` additionally installs the footswitch page-turner mod (Pedalboard only): FS5/FS11 become USB-keyboard
- * Page Down/Up, see docs/PAGE_PEDAL.md and core/page_pedal.h. */
+ * Page Up/Down, see docs/PAGE_PEDAL.md and core/page_pedal.h. */
 typedef struct
 {
   bool nam_pedals;     /* add "NAM" and "NAM TWO" (Pedalboard only), see spy_patch.h and docs/ADDITIVE_PEDAL.md */

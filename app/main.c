@@ -971,7 +971,7 @@ static void draw_frame(Gui* g)
 
       nk_layout_row_dynamic(ctx, 28, 1);
       if (pedalboard)
-        nk_checkbox_label(ctx, "Footswitch page-turner (FS5/FS11 -> USB Page Down/Up)", &shared->enable_page_pedal);
+        nk_checkbox_label(ctx, "Footswitch page-turner (FS5/FS11 -> USB Page Up/Down)", &shared->enable_page_pedal);
       else
       {
         shared->enable_page_pedal = 0;

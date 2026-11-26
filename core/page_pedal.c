@@ -262,21 +262,19 @@ bool nam_page_pedal_patch_assignments(const char* qml_text, int page_down_note, 
   snprintf(props, sizeof(props),
            "\tproperty bool recentActivityPresent: true\n"
            "\n"
-           "\t// Footswitch page-turner (NAM mod): the two switches that send Page Down / Page Up get a fixed colour and a\n"
+           "\t// Footswitch page-turner (NAM mod): the two switches that send Page Down / Page Up get one fixed colour and a\n"
            "\t// \"PAGE DOWN\" / \"PAGE UP\" label instead of what the rig assigns. Notes are the panel's 0-based switch numbers.\n"
            "\tproperty int pageDownNote: %d\n"
            "\tproperty int pageUpNote: %d\n"
-           "\tproperty AppProperty pageDownLed: App.getProperty(\"/GUI/LEDColourCtrl/LEDColour8\")  // blue\n"
-           "\tproperty AppProperty pageUpLed: App.getProperty(\"/GUI/LEDColourCtrl/LEDColour10\")   // white\n"
-           "\tproperty color pageDownColour: pageDownLed && pageDownLed.translator ? pageDownLed.translator.color : Qt.rgba(0, 0, 1, 1)\n"
-           "\tproperty color pageUpColour: pageUpLed && pageUpLed.translator ? pageUpLed.translator.color : Qt.rgba(1, 1, 1, 1)\n",
+           "\tproperty AppProperty pageLed: App.getProperty(\"/GUI/LEDColourCtrl/LEDColour10\")  // light blue on the panel\n"
+           "\tproperty color pageColour: pageLed && pageLed.translator ? pageLed.translator.color : Qt.rgba(0.6, 0.8, 1, 1)\n",
            page_down_note, page_up_note);
   /* the anchor is "\tproperty bool recentActivityPresent: true\n"; replace it with the same line plus the block */
   static const char props_anchor[] = "\tproperty bool recentActivityPresent: true\n";
   /* NOTE: a QML binding must stay on one line here: the parser rejects a continuation line that starts with ':' */
   static const char color_new[] =
-      "            onColor: index === assignment.pageDownNote ? assignment.pageDownColour : (index === assignment.pageUpNote ? "
-      "assignment.pageUpColour : (dimmed ? Qt.darker(rootColour, darkerPerColor[colIdx]) : rootColour))";
+      "            onColor: index === assignment.pageDownNote || index === assignment.pageUpNote ? assignment.pageColour : "
+      "(dimmed ? Qt.darker(rootColour, darkerPerColor[colIdx]) : rootColour)";
   static const char safetext_new[] =
       "                property bool isPage: index === assignment.pageDownNote || index === assignment.pageUpNote\n"
       "                property string pageText: index === assignment.pageDownNote ? \"DOWN\" : \"UP\"\n"

@@ -22,13 +22,13 @@
 bool nam_page_pedal_patch_script(const char* basename, const char* script_text, char** out, char* err,
                                   size_t err_size);
 
-/* The footswitch notes the page-turner defaults to (0-based switch number: FS11 = 10 sends Page Down, FS5 = 4 sends
- * Page Up). Must match the defaults in patch/pagepedal.c; the installer also writes them to /usr/Evil/pagepedal.conf. */
+/* The footswitch notes the page-turner defaults to (0-based switch number: FS11 = 10, lower row, sends Page Down;
+ * FS5 = 4, upper row, sends Page Up; confirmed on hardware). Must match the defaults in patch/pagepedal.c; the installer also writes them to /usr/Evil/pagepedal.conf. */
 #define NAM_PAGE_DOWN_NOTE_DEFAULT 10
 #define NAM_PAGE_UP_NOTE_DEFAULT 4
 
 /* Patches the stock M-Audio_Pass_Through_Assignments.qml (NUL-terminated text) so the two page-turner switches get a
- * fixed LED colour (Page Down blue, Page Up white) and a "PAGE DOWN" / "PAGE UP" label on their small screens. *out is
+ * fixed LED colour (both the panel's LEDColour10, light blue) and a "PAGE DOWN" / "PAGE UP" label on their small screens. *out is
  * malloc'd, NUL-terminated. Idempotent. Refuses (false + reason) if an anchor isn't found exactly once. */
 bool nam_page_pedal_patch_assignments(const char* qml_text, int page_down_note, int page_up_note, char** out, char* err,
                                       size_t err_size);
