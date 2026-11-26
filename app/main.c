@@ -170,6 +170,7 @@ typedef struct
   int selected_model;
   int enable_page_pedal; /* footswitch page-turner mod (Pedalboard only) -- int because nk_checkbox wants int* */
   int add_nam_pedals;    /* Pedalboard: add the "NAM" and "NAM TWO" pedals (default on) */
+  int add_reverb_pedals; /* with the NAM pedals: also add "Reverb" and "Reverb 2" (opt-in, untested on hardware) */
   int anxiety_hijack;    /* opt-in legacy mode: Anxiety OD runs NAM (always on for models without NAM pedals) */
   bool enable_v2_hijack; /* with the hijack: false = 2 instances (Anxiety OD only), true = up to 4 (also Anxiety OD V2) */
   int accepted_risk;     /* "I own this device and accept the risk" -- Install stays disabled until ticked */
@@ -413,6 +414,7 @@ static int worker_main(void* data)
   opts.nam_pedals = is_pedalboard && shared->add_nam_pedals != 0;
   opts.anxiety_hijack = !is_pedalboard || shared->anxiety_hijack != 0;
   opts.anxiety_v2 = opts.anxiety_hijack && shared->enable_v2_hijack;
+  opts.reverb_pedal = opts.nam_pedals && shared->add_reverb_pedals != 0;
   opts.page_pedal = shared->enable_page_pedal != 0;
   shared->downloading = true;
   SDL_UnlockMutex(shared->mutex);
@@ -958,12 +960,22 @@ int main(int argc, char** argv)
           nk_checkbox_label(ctx, "Add the NAM pedals (\"NAM\", \"NAM TWO\": four per rig)",
                             &shared.add_nam_pedals);
           nk_layout_row_dynamic(ctx, 28, 1);
+          if (shared.add_nam_pedals)
+            nk_checkbox_label(ctx, "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\"; untested on hardware)",
+                              &shared.add_reverb_pedals);
+          else
+          {
+            shared.add_reverb_pedals = 0;
+            nk_label(ctx, "Reverb pedals: need the NAM pedals", NK_TEXT_LEFT);
+          }
+          nk_layout_row_dynamic(ctx, 28, 1);
           nk_checkbox_label(ctx, "Also make Anxiety OD run NAM (keeps your existing pedalboards working)",
                             &shared.anxiety_hijack);
         }
         else
         {
           shared.add_nam_pedals = 0;
+          shared.add_reverb_pedals = 0;
           shared.anxiety_hijack = 1;
           nk_layout_row_dynamic(ctx, 24, 1);
           nk_label(ctx, "This model has no NAM pedals yet: Anxiety OD runs NAM.", NK_TEXT_LEFT);

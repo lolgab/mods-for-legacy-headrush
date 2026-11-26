@@ -4,9 +4,9 @@ An additive pedal pair, **Reverb** and **Reverb 2**, next to the NAM pair
 ([ADDITIVE_PEDAL.md](ADDITIVE_PEDAL.md)). They appear at the end of the
 **Reverb** list of the block-type picker and run a plate reverb instead of NAM.
 It is a third pair next to "NAM" and "NAM TWO": 6 extra pedal ids in all.
-**Opt-in and not yet flashed on hardware**:
-`gui-core-cli ... --model pedalboard --reverb-pedal` (needs the NAM pedals,
-the Pedalboard default). Not in the GUI.
+**Opt-in and not yet flashed on hardware**: tick *Also add the Reverb pedals*
+in the GUI, or `gui-core-cli ... --model pedalboard --reverb-pedal` (both need
+the NAM pedals, the Pedalboard default).
 
 ## Algorithm
 

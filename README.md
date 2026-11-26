@@ -163,6 +163,15 @@ blocks on a board, so by default that's 2 NAM instances max, and Anxiety OD
 the same way, for up to 4 hijacked NAM instances total — at the cost of losing
 Anxiety OD V2's real sound board-wide too.
 
+## Reverb pedals (optional, Pedalboard only, experimental)
+
+Tick **Also add the Reverb pedals** in the installer (or pass
+`--reverb-pedal` to the CLI; needs the NAM pedals) to add **Reverb** and
+**Reverb 2** at the end of the Reverb list. They run Plate, Hall, Room and
+Spring algorithms, picked on the pedal's detail page. **Not yet tested on
+hardware**: keep the `(stock)` updater handy — see
+[docs/REVERB_PEDAL.md](docs/REVERB_PEDAL.md).
+
 ## Footswitch page-turner (optional, Pedalboard only)
 
 Tick **Footswitch page-turner** in the installer (or pass `--page-pedal` to
@@ -232,6 +241,7 @@ INPUT / OUTPUT still trim on top. **OFF** (the default) leaves the signal as is.
   the model readout, and what doesn't work.
 - [docs/QML_PAGES.md](docs/QML_PAGES.md) — the parameter names and detail
   pages of the NAM pedals.
+- [docs/REVERB_PEDAL.md](docs/REVERB_PEDAL.md) — the Reverb pedals.
 - [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md) — the footswitch page-turner.
 - [docs/BUILDING.md](docs/BUILDING.md) — building `nam-mod-gui` from
   source.
