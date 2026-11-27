@@ -71,10 +71,14 @@ starts `display_watcher()` once. It:
    as soon as the value or the file count changes. It must follow the prop to
    its *current* desc each tick: patching only the desc found at the last
    sweep lags by up to a second because the desc address changes per move.
-5. Sets `disp_db` on every engine instance when all NAM Level and Tone descs
-   read in dB, so the engine uses the matching gain curve
-   (`trim_gain_fx`: dB = -60 + 72x, silent at <= 0.4%) instead of the
-   percent curve.
+5. The engine's INPUT / OUTPUT gain always follows the dB readout
+   (`trim_gain_fx`: dB = -60 + 72x, silent at <= 0.4%), even while a fader
+   still shows percent (a few seconds after boot, or while a page is
+   rebuilt). It used to switch every NAM pedal to the old percent curve when
+   one fader stayed unconverted for a few seconds; the same fader position is
+   up to 24 dB louder there, on input and output at once, which is what made
+   the volume jump "for no reason". The journal still says which readout the
+   faders show (`[nam_disp] NAM INPUT / OUTPUT faders read in dB|PERCENT`).
 
 ### File list at boot
 

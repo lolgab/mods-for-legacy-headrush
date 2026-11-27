@@ -267,30 +267,12 @@ float trim_gain(float raw01)
   return std::pow(10.0f, db / 20.0f);
 }
 
-// dB-scale trim for the additive NAM pedals: -Inf .. +12 dB over the fader's 0..1 range, 0 dB at the default
-// (0.5). Below center the gain falls linearly in dB down to -60 dB at the very bottom (a plain dB taper), and the
-// last few percent fade on to true silence, so the bottom of the travel is "-Inf".
-float trim_gain_db(float raw01)
-{
-  if (raw01 <= 0.0f)
-    return 0.0f;
-  float db;
-  float extra = 1.0f;
-  if (raw01 < 0.5f)
-  {
-    db = -60.0f * (1.0f - raw01 * 2.0f);
-    if (raw01 < 0.03f)
-      extra = raw01 / 0.03f;
-  }
-  else
-  {
-    db = (raw01 - 0.5f) * 2.0f * trim_max_db();
-  }
-  return extra * std::pow(10.0f, db / 20.0f);
-}
-
 // The FX-Loop's SEND/RETURN faders (-60..+12 dB, "%.1f dB") -- what the additive NAM pedals' Level/Tone show once
-// their translators were cloned from those (nam_eng_init): dB is linear in the fader position.
+// their translators were cloned from those (nam_eng_init): dB is linear in the fader position. The NAM pedals' INPUT
+// and OUTPUT always use this curve, whatever the fader shows right now (percent for a few seconds after boot or while
+// a page is rebuilt). They used to follow the display: one unconverted fader anywhere flipped every NAM pedal to the
+// old percent curve, where the same fader position is up to 24 dB louder (0.5: -24 dB here, 0 dB there), on input
+// and output at once -- the "volume suddenly grows a lot" report.
 float trim_gain_fx(float raw01)
 {
   if (raw01 <= 0.004f)
@@ -572,9 +554,6 @@ struct ModelState
   // Diagnostics (additive NAM pedals): process() calls seen, for the journal heartbeat in nam_process_common.
   std::atomic<uint32_t> calls{0};
 
-  // Additive NAM pedals: set once the Level/Tone faders' translators were cloned from the FX-Loop's dB ones, so the
-  // trim gain must follow that display's curve (see trim_gain_fx).
-  std::atomic<bool> disp_db{false};
   std::atomic<bool> is_eng{false};
 };
 
@@ -1802,9 +1781,9 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
 
   // Tone/Level are [0,1] with 0.5=center/unity, 0.0=silence -- trim_gain()
   // takes that range directly.
-  const bool fx_curve = kl.db_trim && s.disp_db.load(std::memory_order_relaxed);
-  float in_gain = fx_curve ? trim_gain_fx(tone_raw) : kl.db_trim ? trim_gain_db(tone_raw) : trim_gain(tone_raw);
-  float out_gain = fx_curve ? trim_gain_fx(level_raw) : kl.db_trim ? trim_gain_db(level_raw) : trim_gain(level_raw);
+  // NAM pedals: the dB fader curve, always (see trim_gain_fx); Anxiety OD: its knob curve
+  float in_gain = kl.db_trim ? trim_gain_fx(tone_raw) : trim_gain(tone_raw);
+  float out_gain = kl.db_trim ? trim_gain_fx(level_raw) : trim_gain(level_raw);
   // dsp[0] is non-null whenever a real model is active (see silent_active below); the model is only swapped while
   // faded out / muted, so reading its metadata here is safe.
   const bool cal_on = hilo_is_on(this_, kl.hilo);
@@ -2630,7 +2609,7 @@ void display_watcher()
   // saved FX-Loop Return / Send descs: the dB template the Level / Tone descs are converted from, at any moment
   uint8_t ret_bytes[kDescSize] = {}, send_bytes[kDescSize] = {};
   bool have_donors = false;
-  int percent_passes = 0; // consecutive passes with an unconverted Level / Tone desc (debounces the curve switch)
+  int percent_passes = 0; // consecutive passes with an unconverted Level / Tone desc (debounces the log line)
   for (int loops = 0;; ++loops)
   {
     report_engine_stats();
@@ -2807,8 +2786,8 @@ void display_watcher()
       }
     }
 
-    // dB gain curve once every NAM Level / Tone translator reads in dB (instances are not told apart any more:
-    // the props are patched wherever they are found, the engines only need the flag)
+    // Whether every NAM Level / Tone fader reads in dB, for the journal only: the gain no longer depends on it (see
+    // trim_gain_fx)
     bool any_level = false, any_tone = false, all_db = true;
     const auto names_now = drive_names();
     publish_model_names(names_now);
@@ -2833,25 +2812,15 @@ void display_watcher()
       all_db = all_db && db;
       (b.kind == Binding::Level ? any_level : any_tone) = true;
     }
-    // only fall back to the old curve if an unconverted desc persists (the 2 ms loop converts a new one at once)
+    // log only a state that lasts (the 2 ms loop converts a new desc at once)
     percent_passes = (any_level && any_tone && !all_db) ? percent_passes + 1 : 0;
-    static bool curve_db = false;
-    if (any_level && any_tone && all_db)
-      curve_db = true;
-    else if (percent_passes >= 8)
-      curve_db = false;
-    const bool use_db = curve_db;
-    static int last_use_db = -1;
-    if (static_cast<int>(use_db) != last_use_db)
+    static int last_all_db = -1;
+    const int all_db_now = any_level && any_tone && all_db ? 1 : percent_passes >= 8 ? 0 : last_all_db;
+    if (all_db_now != last_all_db)
     {
-      last_use_db = static_cast<int>(use_db);
-      std::fprintf(stderr, "[nam_disp] gain curve: %s (Level descs in dB: %s, Tone: %s, all in dB: %s)\n",
-                   use_db ? "dB" : "PERCENT (old curve)", any_level ? "some" : "none", any_tone ? "some" : "none",
-                   all_db ? "yes" : "no");
+      last_all_db = all_db_now;
+      std::fprintf(stderr, "[nam_disp] NAM INPUT / OUTPUT faders read in %s\n", all_db_now ? "dB" : "PERCENT");
     }
-    for (int k = 0; k < kMaxInstances; ++k)
-      if (g_instances[k].is_eng.load(std::memory_order_relaxed))
-        g_instances[k].disp_db.store(use_db, std::memory_order_relaxed);
     if (n_models != last_models)
     {
       last_models = n_models;
