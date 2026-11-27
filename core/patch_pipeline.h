@@ -1,4 +1,4 @@
-/* patch_pipeline.h -- the actual "apply the NAM mod" pipeline, factored out
+/* patch_pipeline.h -- the actual "apply the selected mods" pipeline, factored out
  * of tools/gui_core_cli.c so the GUI app can call the exact same code
  * instead of re-implementing or shelling out to the CLI. Operates on
  * in-memory buffers for the stock/output image (the caller owns file I/O
@@ -12,38 +12,48 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "mods.h"
+
 /* Called with a human-readable status line at each pipeline milestone
  * (same "OK ..." messages the CLI prints) -- the GUI appends these to its
  * log view, the CLI just printf's them. Never called with an error; on
  * failure the function returns false and fills `err` instead. */
 typedef void (*NamProgressFn)(const char* message, void* user_data);
 
-/* What to install. On the Pedalboard the default is `nam_pedals` alone: two new pedals, "NAM" and "NAM TWO" (two instances each, four per rig), appear in
- * the Distortion list and nothing stock is touched. `anxiety_hijack` is the older design, kept opt-in for people whose
- * existing pedalboards use Anxiety OD as the NAM engine: Anxiety OD (v1) itself runs NAM, and with `anxiety_v2` the
- * separate Anxiety OD V2 does too (up to 4 hijacked instances in all). Both can be on together. The other models
- * (MX5, Gigboard) have no additive support yet, so for them `anxiety_hijack` is the only option and must be set.
- * `page_pedal` additionally installs the footswitch page-turner mod (Pedalboard only): FS5/FS11 become USB-keyboard
- * Page Up/Down, see docs/PAGE_PEDAL.md and core/page_pedal.h. */
+/* What to install. `mods` is the selection (see mods.h): on the Pedalboard
+ * the default is the NAM pedals alone (two new pedals, "NAM" and "NAM TWO",
+ * two instances each, appear in the Distortion list and nothing stock is
+ * touched); the Anxiety OD hijack is the older design, opt-in there and the
+ * default on the MX5 / Gigboard, whose NAM pedals are EXPERIMENTAL (derived
+ * from the Pedalboard's, never run on those devices; core/spy_targets.c).
+ * The Reverb pedals (NAM_MOD_REVERB_PEDAL, docs/REVERB_PEDAL.md) are a third
+ * pair on top of the NAM pedals; on the Pedalboard they don't fit together
+ * with the Anxiety OD hijack. Any other combination is allowed, including no
+ * NAM at all, as long as each mod supports the model.
+ *
+ * The page-turner (NAM_MOD_PAGE_PEDAL) defaults to FS11 = Page Down and
+ * FS5 = Page Up; set page_notes_set to use page_down_note / page_up_note
+ * instead. */
 typedef struct
 {
-  bool nam_pedals;     /* add "NAM" and "NAM TWO" (Pedalboard only), see spy_patch.h and docs/ADDITIVE_PEDAL.md */
-  bool anxiety_hijack; /* legacy: Anxiety OD (v1) process() runs NAM */
-  bool anxiety_v2;     /* with anxiety_hijack: also hijack Anxiety OD V2's separate process() slot */
-  bool page_pedal;
+  NamModSelection mods;
   bool page_notes_set; /* page-turner: use page_down_note / page_up_note instead of the defaults (FS11 / FS5) */
   int page_down_note;  /* 0-based footswitch numbers (FS number - 1) */
   int page_up_note;
-  bool reverb_pedal;   /* with nam_pedals: also add "Reverb" / "Reverb 2" (Dattorro plate reverb), see docs/REVERB_PEDAL.md */
 } NamPatchOptions;
 
 /* `workdir` must already exist (the caller creates and later removes it,
  * e.g. via mkdtemp) -- used only for the rootfs ext4 image's temp files.
- * libnam_hook.so/libnam_preload.so/trampoline_gonk.bin are compiled
- * directly into the binary (see core/nam_blobs_embedded.h), not read from
- * disk. `model_name` may be NULL to auto-detect from the stock image's
- * `compatible` string. `opts` selects what is installed (see NamPatchOptions); at least one of nam_pedals /
- * anxiety_hijack must be set.
+ * Everything a mod installs (libnam_hook.so, libnam_preload.so,
+ * trampoline_gonk.bin, the page-turner daemon, mod scripts/units/binaries)
+ * is compiled directly into the binary (see core/nam_blobs_embedded.h and
+ * core/mod_payloads_embedded.h), not read from disk. `model_name` may be
+ * NULL to auto-detect from the stock image's `compatible` string.
+ *
+ * `opts->mods` is validated against the chosen model before anything is
+ * touched: at least one mod selected, every selected mod supports the
+ * model, and every selected mod's requirement is selected too. Without any
+ * NAM mod, Evil and the NAM libraries are left stock.
  *
  * On success, *out_img_data is a malloc'd buffer (caller frees it)
  * containing the patched Update.img, and returns true. On failure, writes

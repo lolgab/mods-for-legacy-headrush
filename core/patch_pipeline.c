@@ -1,6 +1,7 @@
 /* patch_pipeline.c -- see patch_pipeline.h. */
 #include "patch_pipeline.h"
 
+#include "device_mods.h"
 #include "elf_patch.h"
 #include "ext4_image.h"
 #include "fit_image.h"
@@ -99,22 +100,16 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
 {
   *out_img_data = NULL;
   *out_img_len = 0;
-  const bool nam_pedals = opts->nam_pedals;
-  const bool anxiety_hijack = opts->anxiety_hijack;
-  const bool enable_v2_hijack = opts->anxiety_hijack && opts->anxiety_v2;
-  const bool enable_page_pedal = opts->page_pedal;
-  const bool reverb_pedal = opts->nam_pedals && opts->reverb_pedal;
+  const NamModSelection* mods = &opts->mods;
+  const bool nam_pedals = mods->enabled[NAM_MOD_NAM_PEDALS];
+  const bool anxiety_hijack = mods->enabled[NAM_MOD_ANXIETY];
+  const bool enable_v2_hijack = anxiety_hijack && mods->enabled[NAM_MOD_ANXIETY_V2];
+  const bool enable_page_pedal = mods->enabled[NAM_MOD_PAGE_PEDAL];
+  const bool reverb_pedal = mods->enabled[NAM_MOD_REVERB_PEDAL]; /* nam_mods_validate: only with nam_pedals */
   bool qml_pages = false;
-  if (opts->reverb_pedal && !opts->nam_pedals)
-  {
-    set_err(err, err_size, "the Reverb pedals are built on the additive NAM pedals: enable them as well");
-    return false;
-  }
-  if (!nam_pedals && !anxiety_hijack)
-  {
-    set_err(err, err_size, "nothing to install: enable the NAM pedals and/or the Anxiety OD hijack");
-    return false;
-  }
+  const bool want_nam = nam_pedals || anxiety_hijack;
+  /* the NAM modes and the page-turner both edit Evil's launcher script */
+  const bool want_launcher = want_nam || enable_page_pedal;
 
   FitProps props = {0};
   FitProps verify_props = {0};
@@ -161,6 +156,12 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   else
     report(progress, progress_user_data, "OK  model target: %s", target->name);
 
+  /* also enforces the per-model mods (page-turner, MX5 mods) and the Pedalboard's Reverb / Anxiety OD conflict:
+   * see mods.c */
+  if (!nam_mods_validate(mods, target->name, err, err_size))
+    goto cleanup;
+  report(progress, progress_user_data, "OK  mods selected: %s", nam_mods_selection_str(mods));
+
   uint32_t splash_off, splash_len, recov_off, recov_len, rootfs_off, rootfs_len;
   if (!nam_fit_get_bytes(&props, "//images/splash", "data", &splash_off, &splash_len)
       || !nam_fit_get_bytes(&props, "//images/recoverysplash", "data", &recov_off, &recov_len)
@@ -193,159 +194,190 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   if (!nam_ext4_dump(img, "/usr/Evil/Evil", &evil_data, &evil_len, err, err_size))
     goto cleanup;
 
-  size_t script_len;
-  if (!nam_ext4_dump(img, "/usr/Evil/Scripts/evil", &script_data_raw, &script_len, err, err_size))
-    goto cleanup;
-  script_data = (char*)malloc(script_len + 1);
-  if (!script_data)
-  {
-    set_err(err, err_size, "out of memory");
-    goto cleanup;
-  }
-  memcpy(script_data, script_data_raw, script_len);
-  script_data[script_len] = '\0';
-  free(script_data_raw);
-  script_data_raw = NULL;
+  /* Evil is only re-injected if some mod actually changed it, so a
+   * selection of only rootfs-level mods leaves the stock binary untouched. */
+  bool evil_modified = false;
 
-  const uint8_t* tramp = g_nam_trampoline_gonk_bin;
-  size_t tramp_len = (size_t)g_nam_trampoline_gonk_bin_len;
-  if (tramp_len != 32)
+  if (want_launcher)
   {
-    set_err(err, err_size, "embedded trampoline_gonk.bin is %zu bytes, expected exactly 32", tramp_len);
-    goto cleanup;
-  }
-
-  ElfPatchResult elf_result = {0};
-  ElfPatchResult elf_result_v2 = {0};
-  bool has_v2_hijack = false;
-  uint32_t eng_hook_slot = 0, eng_init_slot = 0, eng_tab = 0;
-  const SpyTarget* spy = nam_spy_target(target->name);
-  if (nam_pedals && !spy)
-  {
-    set_err(err, err_size, "the NAM pedals have no target for %s (use the Anxiety OD hijack there)", target->name);
-    goto cleanup;
-  }
-  if (reverb_pedal && anxiety_hijack && strcmp(target->name, "pedalboard") == 0)
-  {
-    /* the registry tables of three pairs plus the hijack trampolines overflow the Pedalboard's code cave */
-    set_err(err, err_size, "on the Pedalboard the Reverb pedals and the Anxiety OD hijack don't fit together: pick one");
-    goto cleanup;
-  }
-  if (nam_pedals && spy->experimental)
-    report(progress, progress_user_data,
-           "!!  EXPERIMENTAL: the NAM%s pedals on the %s were derived from the Pedalboard's and have never run on a "
-           "device",
-           reverb_pedal ? " and Reverb" : "", target->name);
-
-  if (anxiety_hijack)
-  {
-    if (!nam_elf_patch_gonkulator(evil_data, evil_len, tramp, target->engine_vtable_vaddr, target->orig_process_fn,
-                                   &elf_result, err, err_size))
+    size_t script_len;
+    if (!nam_ext4_dump(img, "/usr/Evil/Scripts/evil", &script_data_raw, &script_len, err, err_size))
       goto cleanup;
-    report(progress, progress_user_data, "OK  Anxiety OD hijack patched: trampoline @ 0x%x, hook_slot @ 0x%x",
-           elf_result.trampoline_vaddr, elf_result.hook_slot_addr);
-
-    if (enable_v2_hijack)
+    script_data = (char*)malloc(script_len + 1);
+    if (!script_data)
     {
-      if (!nam_elf_patch_gonkulator(evil_data, evil_len, tramp, target->v2_engine_vtable_vaddr,
-                                     target->v2_orig_process_fn, &elf_result_v2, err, err_size))
-        goto cleanup;
-      has_v2_hijack = true;
-      report(progress, progress_user_data, "OK  Anxiety OD V2 hijack patched: trampoline @ 0x%x, hook_slot @ 0x%x",
-             elf_result_v2.trampoline_vaddr, elf_result_v2.hook_slot_addr);
-    }
-
-    if (target->qml_rename_count > 0)
-    {
-      if (!nam_qml_patch(evil_data, evil_len, target, err, err_size))
-        goto cleanup;
-      /* No visible effect on hardware: see docs/TECHNICAL.md "What didn't make it in". */
-      report(progress, progress_user_data, "OK  QML knob-label bytes patched (no on-screen effect)");
-    }
-    else
-    {
-      report(progress, progress_user_data, "    (QML knob relabel skipped for %s -- no per-pedal target)",
-             target->name);
-    }
-  }
-
-  if (nam_pedals)
-  {
-    /* the registry patch parks tables in the zero slack after the R+W segment, which is the very end of the file */
-    uint8_t* grown = (uint8_t*)realloc(evil_data, evil_len + 4096);
-    if (!grown)
-    {
-      set_err(err, err_size, "out of memory growing Evil");
+      set_err(err, err_size, "out of memory");
       goto cleanup;
     }
-    memset(grown + evil_len, 0, 4096);
-    evil_data = grown;
-    evil_len += 4096;
-    /* every pair shares the NAM engine class; the hook tells pedals apart by name (the Reverb pair; each NAM pedal's
-     * own quality mode): the engine stub records (engine, &name) when a pedal is created (record hook, always on) */
-    const NamPair pairs[3] = {{"NAM", "NAM", NAM_ENGINE_TYPE, 0},
-                              {"NAM TWO", "NAM TWO", NAM_ENGINE_TYPE, 0},
-                              {"Reverb", "Reverb", NAM_ENGINE_TYPE, 0, NAM_CAT_REVERB}};
-    const uint32_t npairs = reverb_pedal ? 3 : 2;
-    if (!nam_elf_patch_registry(spy, evil_data, evil_len, pairs, npairs, err, err_size)
-        || !nam_elf_patch_node_registration(spy, evil_data, evil_len, pairs, npairs, &eng_init_slot, &eng_tab, err,
-                                            err_size)
-        || !nam_elf_patch_engine_class(spy, evil_data, evil_len, 2 * npairs, eng_tab, true, &eng_hook_slot, err,
-                                       err_size))
-      goto cleanup;
-    report(progress, progress_user_data,
-           "OK  NAM pedals registered: \"NAM\" and \"NAM TWO\" (2 instances each), engine hook_slot @ 0x%x",
-           eng_hook_slot);
-    if (reverb_pedal)
-      report(progress, progress_user_data, "OK  Reverb pedals registered: \"Reverb\" and \"Reverb 2\" in the Reverb list (Dattorro plate)");
+    memcpy(script_data, script_data_raw, script_len);
+    script_data[script_len] = '\0';
+    free(script_data_raw);
+    script_data_raw = NULL;
+  }
 
-    if (!nam_qml_override_blockdetails(evil_data, evil_len, "file:///usr/Evil/Resources/pedal_ui.qml", err, err_size)
-        || !nam_qml_override_stomp(evil_data, evil_len, err, err_size))
-      goto cleanup;
-    qml_pages = true;
-    report(progress, progress_user_data,
-           "OK  detail pages: BlockDetails.qml loads /usr/Evil/Resources/pedal_ui.qml for the additive pedals; the "
-           "Rig page draws them");
-    /* the encoder tiles (real parameter names under the knobs) exist on the Pedalboard only: the MX5 and the
-     * Gigboard have no EncoderParamInfo.qml / EncoderField.qml source, their knobs keep the Glorious Drive names */
-    if (strcmp(target->name, "pedalboard") == 0)
+  if (want_nam)
+  {
+    ElfPatchResult elf_result = {0};
+    ElfPatchResult elf_result_v2 = {0};
+    bool has_v2_hijack = false;
+    uint32_t eng_hook_slot = 0, eng_init_slot = 0, eng_tab = 0;
+    const SpyTarget* spy = nam_spy_target(target->name);
+    if (nam_pedals && !spy)
     {
-      if (!nam_qml_override_encoder_tile(evil_data, evil_len, err, err_size)
-          || !nam_qml_override_encoder_field(evil_data, evil_len, err, err_size))
-        goto cleanup;
-      report(progress, progress_user_data, "OK  EncoderParamInfo.qml shows their real parameter names on the tiles");
+      set_err(err, err_size, "the NAM pedals have no target for %s (use the Anxiety OD hijack there)", target->name);
+      goto cleanup;
     }
-    else
+    if (nam_pedals && spy->experimental)
       report(progress, progress_user_data,
-             "    (knob tiles keep the stock DRIVE / LEVEL / TONE captions on the %s: no tile source to edit)",
-             target->name);
-  }
+             "!!  EXPERIMENTAL: the NAM%s pedals on the %s were derived from the Pedalboard's and have never run on a "
+             "device",
+             reverb_pedal ? " and Reverb" : "", target->name);
 
-  if (enable_page_pedal && strcmp(target->name, "pedalboard") != 0)
+    if (anxiety_hijack)
+    {
+      const uint8_t* tramp = g_nam_trampoline_gonk_bin;
+      size_t tramp_len = (size_t)g_nam_trampoline_gonk_bin_len;
+      if (tramp_len != 32)
+      {
+        set_err(err, err_size, "embedded trampoline_gonk.bin is %zu bytes, expected exactly 32", tramp_len);
+        goto cleanup;
+      }
+
+      if (!nam_elf_patch_gonkulator(evil_data, evil_len, tramp, target->engine_vtable_vaddr, target->orig_process_fn,
+                                     &elf_result, err, err_size))
+        goto cleanup;
+      report(progress, progress_user_data, "OK  Anxiety OD hijack patched: trampoline @ 0x%x, hook_slot @ 0x%x",
+             elf_result.trampoline_vaddr, elf_result.hook_slot_addr);
+
+      if (enable_v2_hijack)
+      {
+        if (!nam_elf_patch_gonkulator(evil_data, evil_len, tramp, target->v2_engine_vtable_vaddr,
+                                       target->v2_orig_process_fn, &elf_result_v2, err, err_size))
+          goto cleanup;
+        has_v2_hijack = true;
+        report(progress, progress_user_data, "OK  Anxiety OD V2 hijack patched: trampoline @ 0x%x, hook_slot @ 0x%x",
+               elf_result_v2.trampoline_vaddr, elf_result_v2.hook_slot_addr);
+      }
+
+      if (target->qml_rename_count > 0)
+      {
+        if (!nam_qml_patch(evil_data, evil_len, target, err, err_size))
+          goto cleanup;
+        /* No visible effect on hardware: see docs/TECHNICAL.md "What didn't make it in". */
+        report(progress, progress_user_data, "OK  QML knob-label bytes patched (no on-screen effect)");
+      }
+      else
+      {
+        report(progress, progress_user_data, "    (QML knob relabel skipped for %s -- no per-pedal target)",
+               target->name);
+      }
+    }
+
+    if (nam_pedals)
+    {
+      /* the registry patch parks tables in the zero slack after the R+W segment, which is the very end of the file */
+      uint8_t* grown = (uint8_t*)realloc(evil_data, evil_len + 4096);
+      if (!grown)
+      {
+        set_err(err, err_size, "out of memory growing Evil");
+        goto cleanup;
+      }
+      memset(grown + evil_len, 0, 4096);
+      evil_data = grown;
+      evil_len += 4096;
+      /* every pair shares the NAM engine class; the hook tells pedals apart by name (the Reverb pair; each NAM
+       * pedal's own quality mode): the engine stub records (engine, &name) when a pedal is created (record hook,
+       * always on) */
+      const NamPair pairs[3] = {{"NAM", "NAM", NAM_ENGINE_TYPE, 0},
+                                {"NAM TWO", "NAM TWO", NAM_ENGINE_TYPE, 0},
+                                {"Reverb", "Reverb", NAM_ENGINE_TYPE, 0, NAM_CAT_REVERB}};
+      const uint32_t npairs = reverb_pedal ? 3 : 2;
+      if (!nam_elf_patch_registry(spy, evil_data, evil_len, pairs, npairs, err, err_size)
+          || !nam_elf_patch_node_registration(spy, evil_data, evil_len, pairs, npairs, &eng_init_slot, &eng_tab, err,
+                                              err_size)
+          || !nam_elf_patch_engine_class(spy, evil_data, evil_len, 2 * npairs, eng_tab, true, &eng_hook_slot, err,
+                                         err_size))
+        goto cleanup;
+      report(progress, progress_user_data,
+             "OK  NAM pedals registered: \"NAM\" and \"NAM TWO\" (2 instances each), engine hook_slot @ 0x%x",
+             eng_hook_slot);
+      if (reverb_pedal)
+        report(progress, progress_user_data,
+               "OK  Reverb pedals registered: \"Reverb\" and \"Reverb 2\" in the Reverb list (Dattorro plate)");
+
+      if (!nam_qml_override_blockdetails(evil_data, evil_len, "file:///usr/Evil/Resources/pedal_ui.qml", err, err_size)
+          || !nam_qml_override_stomp(evil_data, evil_len, err, err_size))
+        goto cleanup;
+      qml_pages = true;
+      report(progress, progress_user_data,
+             "OK  detail pages: BlockDetails.qml loads /usr/Evil/Resources/pedal_ui.qml for the additive pedals; the "
+             "Rig page draws them");
+      /* the encoder tiles (real parameter names under the knobs) exist on the Pedalboard only: the MX5 and the
+       * Gigboard have no EncoderParamInfo.qml / EncoderField.qml source, their knobs keep the Glorious Drive names */
+      if (strcmp(target->name, "pedalboard") == 0)
+      {
+        if (!nam_qml_override_encoder_tile(evil_data, evil_len, err, err_size)
+            || !nam_qml_override_encoder_field(evil_data, evil_len, err, err_size))
+          goto cleanup;
+        report(progress, progress_user_data, "OK  EncoderParamInfo.qml shows their real parameter names on the tiles");
+      }
+      else
+        report(progress, progress_user_data,
+               "    (knob tiles keep the stock DRIVE / LEVEL / TONE captions on the %s: no tile source to edit)",
+               target->name);
+    }
+    evil_modified = true;
+
+    char hook_slot_hex[32];
+    snprintf(hook_slot_hex, sizeof(hook_slot_hex), "0x%x", elf_result.hook_slot_addr);
+    char hook_slot_eng_hex[32];
+    snprintf(hook_slot_eng_hex, sizeof(hook_slot_eng_hex), "0x%x", eng_hook_slot);
+    char eng_init_hex[32], eng_tab_hex[32];
+    snprintf(eng_init_hex, sizeof(eng_init_hex), "0x%x", eng_init_slot);
+    snprintf(eng_tab_hex, sizeof(eng_tab_hex), "0x%x", eng_tab);
+    char hook_slot_v2_hex[32];
+    if (has_v2_hijack)
+      snprintf(hook_slot_v2_hex, sizeof(hook_slot_v2_hex), "0x%x", elf_result_v2.hook_slot_addr);
+    if (!nam_build_launcher_script(script_data, anxiety_hijack ? hook_slot_hex : NULL,
+                                    has_v2_hijack ? hook_slot_v2_hex : NULL, nam_pedals ? hook_slot_eng_hex : NULL,
+                                    nam_pedals ? eng_init_hex : NULL, nam_pedals ? eng_tab_hex : NULL, nam_pedals,
+                                    &new_script, err, err_size))
+      goto cleanup;
+    free(script_data);
+    script_data = NULL;
+
+    if (!nam_ext4_inject(img, "/usr/Evil/libnam_hook.so", g_nam_hook_so, (size_t)g_nam_hook_so_len, 0755, err,
+                          err_size))
+      goto cleanup;
+    if (!nam_ext4_inject(img, "/usr/Evil/libnam_preload.so", g_nam_preload_so, (size_t)g_nam_preload_so_len, 0755,
+                          err, err_size))
+      goto cleanup;
+    report(progress, progress_user_data, "OK  injected libnam_hook.so, libnam_preload.so");
+    if (qml_pages)
+    {
+      if (!nam_ext4_inject(img, "/usr/Evil/Resources/pedal_ui.qml", g_ui_pedal_qml, (size_t)g_ui_pedal_qml_len, 0644,
+                           err, err_size)
+          || !nam_ext4_inject(img, "/usr/Evil/Resources/nam_ui.qml", g_ui_nam_qml, (size_t)g_ui_nam_qml_len, 0644, err,
+                              err_size)
+          || !nam_ext4_inject(img, "/usr/Evil/Resources/nam_fix.qml", g_ui_nam_fix_qml, (size_t)g_ui_nam_fix_qml_len,
+                              0644, err, err_size)
+          || !nam_ext4_inject(img, "/usr/Evil/Resources/pedal_art.qml", g_ui_pedal_art_qml,
+                              (size_t)g_ui_pedal_art_qml_len, 0644, err, err_size)
+          || !nam_ext4_inject(img, "/usr/Evil/Resources/rig_block.qml", g_ui_rig_block_qml,
+                              (size_t)g_ui_rig_block_qml_len, 0644, err, err_size)
+          || (reverb_pedal
+              && !nam_ext4_inject(img, "/usr/Evil/Resources/reverb_ui.qml", g_ui_reverb_qml,
+                                  (size_t)g_ui_reverb_qml_len, 0644, err, err_size)))
+        goto cleanup;
+      report(progress, progress_user_data, "OK  injected the detail pages (/usr/Evil/Resources/*_ui.qml)");
+    }
+  }
+  else if (want_launcher)
   {
-    set_err(err, err_size,
-            "the footswitch page-turner mod is Pedalboard-only (its footswitch->note mapping is the Pedalboard's "
-            "12-switch panel); selected target is %s",
-            target->name);
-    goto cleanup;
+    /* no NAM: the page-turner block goes into the stock launcher script */
+    new_script = script_data;
+    script_data = NULL;
   }
-
-  char hook_slot_hex[32];
-  snprintf(hook_slot_hex, sizeof(hook_slot_hex), "0x%x", elf_result.hook_slot_addr);
-  char hook_slot_eng_hex[32];
-  snprintf(hook_slot_eng_hex, sizeof(hook_slot_eng_hex), "0x%x", eng_hook_slot);
-  char eng_init_hex[32], eng_tab_hex[32];
-  snprintf(eng_init_hex, sizeof(eng_init_hex), "0x%x", eng_init_slot);
-  snprintf(eng_tab_hex, sizeof(eng_tab_hex), "0x%x", eng_tab);
-  char hook_slot_v2_hex[32];
-  if (has_v2_hijack)
-    snprintf(hook_slot_v2_hex, sizeof(hook_slot_v2_hex), "0x%x", elf_result_v2.hook_slot_addr);
-  if (!nam_build_launcher_script(script_data, anxiety_hijack ? hook_slot_hex : NULL, has_v2_hijack ? hook_slot_v2_hex : NULL,
-                                  nam_pedals ? hook_slot_eng_hex : NULL, nam_pedals ? eng_init_hex : NULL,
-                                  nam_pedals ? eng_tab_hex : NULL, nam_pedals, &new_script, err, err_size))
-    goto cleanup;
-  free(script_data);
-  script_data = NULL;
 
   if (enable_page_pedal)
   {
@@ -364,6 +396,21 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
            page_down + 1, page_up + 1);
   }
 
+  if (want_launcher)
+  {
+    if (!nam_ext4_inject(img, "/usr/Evil/Scripts/evil", (const uint8_t*)new_script, strlen(new_script), 0755, err,
+                          err_size))
+      goto cleanup;
+    report(progress, progress_user_data, "OK  injected launcher script");
+  }
+
+  if (mods->enabled[NAM_MOD_TUNER_TEMPO])
+  {
+    if (!nam_mod_apply_tuner_tempo(evil_data, evil_len, target->name, progress, progress_user_data, err, err_size))
+      goto cleanup;
+    evil_modified = true;
+  }
+
   if (getenv("NAM_DUMP_EVIL")) /* debugging aid: write the patched Evil next to the image (see docs/DEV_LOOP.md) */
   {
     FILE* df = fopen(getenv("NAM_DUMP_EVIL"), "wb");
@@ -373,40 +420,24 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
       fclose(df);
     }
   }
-  if (!nam_ext4_inject(img, "/usr/Evil/Evil", evil_data, evil_len, 0755, err, err_size))
-    goto cleanup;
-
-  const uint8_t* hook_so = g_nam_hook_so;
-  size_t hook_so_len = (size_t)g_nam_hook_so_len;
-  const uint8_t* preload_so = g_nam_preload_so;
-  size_t preload_so_len = (size_t)g_nam_preload_so_len;
-
-  if (!nam_ext4_inject(img, "/usr/Evil/libnam_hook.so", hook_so, hook_so_len, 0755, err, err_size))
-    goto cleanup;
-  if (!nam_ext4_inject(img, "/usr/Evil/libnam_preload.so", preload_so, preload_so_len, 0755, err, err_size))
-    goto cleanup;
-  if (!nam_ext4_inject(img, "/usr/Evil/Scripts/evil", (const uint8_t*)new_script, strlen(new_script), 0755, err,
-                        err_size))
-    goto cleanup;
-  report(progress, progress_user_data,
-         "OK  injected patched Evil, libnam_hook.so, libnam_preload.so, launcher script");
-  if (qml_pages)
+  if (evil_modified)
   {
-    if (!nam_ext4_inject(img, "/usr/Evil/Resources/pedal_ui.qml", g_ui_pedal_qml, (size_t)g_ui_pedal_qml_len, 0644, err,
-                         err_size)
-        || !nam_ext4_inject(img, "/usr/Evil/Resources/nam_ui.qml", g_ui_nam_qml, (size_t)g_ui_nam_qml_len, 0644, err,
-                            err_size)
-        || !nam_ext4_inject(img, "/usr/Evil/Resources/nam_fix.qml", g_ui_nam_fix_qml, (size_t)g_ui_nam_fix_qml_len, 0644,
-                            err, err_size)
-        || !nam_ext4_inject(img, "/usr/Evil/Resources/pedal_art.qml", g_ui_pedal_art_qml, (size_t)g_ui_pedal_art_qml_len,
-                            0644, err, err_size)
-        || !nam_ext4_inject(img, "/usr/Evil/Resources/rig_block.qml", g_ui_rig_block_qml, (size_t)g_ui_rig_block_qml_len,
-                            0644, err, err_size)
-        || (reverb_pedal
-            && !nam_ext4_inject(img, "/usr/Evil/Resources/reverb_ui.qml", g_ui_reverb_qml, (size_t)g_ui_reverb_qml_len,
-                                0644, err, err_size)))
+    if (!nam_ext4_inject(img, "/usr/Evil/Evil", evil_data, evil_len, 0755, err, err_size))
       goto cleanup;
-    report(progress, progress_user_data, "OK  injected the detail pages (/usr/Evil/Resources/*_ui.qml)");
+    report(progress, progress_user_data, "OK  injected patched Evil");
+  }
+
+  if (mods->enabled[NAM_MOD_USB_CONSOLE])
+  {
+    if (!nam_mod_apply_usb_console(img, target->name, progress, progress_user_data, err, err_size))
+      goto cleanup;
+  }
+
+  /* After usb-console: it provides the /dev/ttyGS1 this serves on. */
+  if (mods->enabled[NAM_MOD_REMOTE_SCREEN])
+  {
+    if (!nam_mod_apply_remote_screen(img, target->name, progress, progress_user_data, err, err_size))
+      goto cleanup;
   }
 
   if (!nam_ext4_verify_basic(img, err, err_size))
