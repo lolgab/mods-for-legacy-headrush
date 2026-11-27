@@ -225,6 +225,12 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
     set_err(err, err_size, "the NAM pedals have no target for %s (use the Anxiety OD hijack there)", target->name);
     goto cleanup;
   }
+  if (reverb_pedal && anxiety_hijack && strcmp(target->name, "pedalboard") == 0)
+  {
+    /* the registry tables of three pairs plus the hijack trampolines overflow the Pedalboard's code cave */
+    set_err(err, err_size, "on the Pedalboard the Reverb pedals and the Anxiety OD hijack don't fit together: pick one");
+    goto cleanup;
+  }
   if (nam_pedals && spy->experimental)
     report(progress, progress_user_data,
            "!!  EXPERIMENTAL: the NAM%s pedals on the %s were derived from the Pedalboard's and have never run on a "

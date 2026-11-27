@@ -172,7 +172,7 @@ typedef struct
   int defaults_model;    /* the model the checkboxes below were last given their defaults for */
   int enable_page_pedal; /* footswitch page-turner mod (Pedalboard only) -- int because nk_checkbox wants int* */
   int add_nam_pedals;    /* add the "NAM" and "NAM TWO" pedals (Pedalboard default; MX5 / Gigboard: experimental, opt-in) */
-  int add_reverb_pedals; /* with the NAM pedals: also add "Reverb" and "Reverb 2" (opt-in, untested on hardware) */
+  int add_reverb_pedals; /* with the NAM pedals: also add "Reverb" and "Reverb 2" (opt-in) */
   int anxiety_hijack;    /* Anxiety OD runs NAM (Pedalboard: opt-in; MX5 / Gigboard: default) */
   bool enable_v2_hijack; /* with the hijack: false = 2 instances (Anxiety OD only), true = up to 4 (also Anxiety OD V2) */
   int accepted_risk;     /* "I own this device and accept the risk" -- Install stays disabled until ticked */
@@ -952,16 +952,24 @@ static void draw_frame(Gui* g)
                                        : "Add the NAM pedals (\"NAM\", \"NAM TWO\": four per rig)",
                           &shared->add_nam_pedals);
         nk_layout_row_dynamic(ctx, 28, 1);
-        if (shared->add_nam_pedals)
-          nk_checkbox_label(ctx,
-                            experimental ? "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\") -- EXPERIMENTAL"
-                                         : "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\"; untested on hardware)",
-                            &shared->add_reverb_pedals);
-        else
+        /* the Pedalboard's code cave holds the Reverb pair or the Anxiety OD hijack, not both (the MX5 / Gigboard
+         * caves are larger): whichever is ticked replaces the other's checkbox with a note */
+        const bool cave_conflict = pedalboard;
+        if (!shared->add_nam_pedals)
         {
           shared->add_reverb_pedals = 0;
           nk_label(ctx, "Reverb pedals: need the NAM pedals", NK_TEXT_LEFT);
         }
+        else if (cave_conflict && shared->anxiety_hijack)
+        {
+          shared->add_reverb_pedals = 0;
+          nk_label(ctx, "Reverb pedals: not together with the Anxiety OD option on the Pedalboard", NK_TEXT_LEFT);
+        }
+        else
+          nk_checkbox_label(ctx,
+                            experimental ? "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\") -- EXPERIMENTAL"
+                                         : "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\")",
+                            &shared->add_reverb_pedals);
         if (experimental && shared->add_nam_pedals)
         {
           const struct nk_color warn = nk_rgb(240, 170, 40);
@@ -976,8 +984,14 @@ static void draw_frame(Gui* g)
                            NK_TEXT_LEFT, warn);
         }
         nk_layout_row_dynamic(ctx, 28, 1);
-        nk_checkbox_label(ctx, "Also make Anxiety OD run NAM (keeps your existing pedalboards working)",
-                          &shared->anxiety_hijack);
+        if (cave_conflict && shared->add_reverb_pedals)
+        {
+          shared->anxiety_hijack = 0;
+          nk_label(ctx, "Anxiety OD option: not together with the Reverb pedals on the Pedalboard", NK_TEXT_LEFT);
+        }
+        else
+          nk_checkbox_label(ctx, "Also make Anxiety OD run NAM (keeps your existing pedalboards working)",
+                            &shared->anxiety_hijack);
       }
       else
       {

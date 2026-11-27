@@ -186,7 +186,7 @@ reboots.
   which crackles).
 
 Switching reloads the model with a short fade. Other (non-A2) models sound the
-same in every mode. Not yet tested on hardware.
+same in every mode. Confirmed on a Pedalboard.
 
 ### NAM pedals on the MX5 and Gigboard (experimental)
 
@@ -208,14 +208,15 @@ no footswitch recovery mode). Differences from the Pedalboard:
 If you try it, please report what happens (boot, pedals in the Distortion list,
 sound, detail page) in an issue.
 
-## Reverb pedals (optional, experimental)
+## Reverb pedals (optional)
 
 Tick **Also add the Reverb pedals** in the installer (or pass
 `--reverb-pedal` to the CLI; needs the NAM pedals; on the MX5 and Gigboard see
 the experimental note above) to add **Reverb** and
 **Reverb 2** at the end of the Reverb list. They run Plate, Hall, Room and
-Spring algorithms, picked on the pedal's detail page. **Not yet tested on
-hardware**: keep the `(stock)` updater handy — see
+Spring algorithms, picked on the pedal's detail page. Confirmed on a
+Pedalboard. They can't be combined with the Anxiety OD option on the
+Pedalboard (the two don't fit together in the firmware's spare space). See
 [docs/REVERB_PEDAL.md](docs/REVERB_PEDAL.md).
 
 ## Footswitch page-turner (optional, Pedalboard only)

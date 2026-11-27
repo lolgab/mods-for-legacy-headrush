@@ -4,7 +4,7 @@ An additive pedal pair, **Reverb** and **Reverb 2**, next to the NAM pair
 ([ADDITIVE_PEDAL.md](ADDITIVE_PEDAL.md)). They appear at the end of the
 **Reverb** list of the block-type picker and run a plate reverb instead of NAM.
 It is a third pair next to "NAM" and "NAM TWO": 6 extra pedal ids in all.
-**Opt-in and not yet flashed on hardware**: tick *Also add the Reverb pedals*
+**Opt-in, confirmed on a Pedalboard**: tick *Also add the Reverb pedals*
 in the GUI, or `gui-core-cli ... --model pedalboard --reverb-pedal` (both need
 the NAM pedals, the Pedalboard default).
 
@@ -96,12 +96,12 @@ All default to 50 %.
   journal for `[nam_eng] engine ... -> Reverb`. A sturdier fix is a separate
   engine class for the Reverb pair (not done).
 
-* Hardware: not flashed. Risks are the same as for the NAM pair plus the
-  second registry pair; the name-based dispatch has only been exercised by the
-  fake-table test.
+* Hardware: confirmed on a Pedalboard. On the Pedalboard the Reverb pair and the
+  Anxiety OD hijack don't fit the code cave together, so the installer offers
+  one or the other (the MX5 / Gigboard caves are larger and take both).
 * The picker's Reverb list is built by the same static initializer as the
   Distortion one, and the same hook is attached to it. The name to pedal-id lookup is by name,
-  so the category should not matter, but this is untested on hardware.
+  so the category does not matter (confirmed on hardware).
   The stock captions are a limit of the firmware UI, as for NAM. A pedal image falls back to `img/Other.png`.
 * The wet level (0.6 on the tap sum) and the knob curves are by ear-free
   calibration only; adjust after listening.

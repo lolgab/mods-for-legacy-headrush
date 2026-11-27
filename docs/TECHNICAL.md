@@ -61,7 +61,7 @@ everything on the board. Measured on the Pedalboard with the NAM pedals:
   `/tmp/nam_mode/<pedal, spaces as _>-<mode>.png` (the hook watches the opens
   with inotify) and the hook writes every pedal's mode to
   `/tmp/nam_mode_state.qml`. `patch/test_nam_quality.c`
-  exercises it all on ARM. Not yet measured on hardware.
+  exercises it all on ARM. Confirmed on a Pedalboard.
 - Each instance runs one model per channel. Run as two channels, an instance
   costs ~250 us per block, so **three active NAMs (~780 us) overran** while two
   (~520 us) did not; the symptom was crackle until a scene deactivated one.
