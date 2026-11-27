@@ -11,6 +11,7 @@
 #include "nam_blobs_embedded.h"
 #include "page_pedal.h"
 #include "qml_patch.h"
+#include "qml_override.h"
 #include "xz_codec.h"
 
 #include <errno.h>
@@ -104,6 +105,8 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   const bool anxiety_hijack = mods->enabled[NAM_MOD_ANXIETY];
   const bool enable_v2_hijack = anxiety_hijack && mods->enabled[NAM_MOD_ANXIETY_V2];
   const bool enable_page_pedal = mods->enabled[NAM_MOD_PAGE_PEDAL];
+  const bool reverb_pedal = mods->enabled[NAM_MOD_REVERB_PEDAL]; /* nam_mods_validate: only with nam_pedals */
+  bool qml_pages = false;
   const bool want_nam = nam_pedals || anxiety_hijack;
   /* the NAM modes and the page-turner both edit Evil's launcher script */
   const bool want_launcher = want_nam || enable_page_pedal;
@@ -153,7 +156,8 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   else
     report(progress, progress_user_data, "OK  model target: %s", target->name);
 
-  /* also enforces the Pedalboard-only mods (NAM pedals, page-turner): see the model lists in mods.c */
+  /* also enforces the per-model mods (page-turner, MX5 mods) and the Pedalboard's Reverb / Anxiety OD conflict:
+   * see mods.c */
   if (!nam_mods_validate(mods, target->name, err, err_size))
     goto cleanup;
   report(progress, progress_user_data, "OK  mods selected: %s", nam_mods_selection_str(mods));
@@ -217,6 +221,17 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
     ElfPatchResult elf_result_v2 = {0};
     bool has_v2_hijack = false;
     uint32_t eng_hook_slot = 0, eng_init_slot = 0, eng_tab = 0;
+    const SpyTarget* spy = nam_spy_target(target->name);
+    if (nam_pedals && !spy)
+    {
+      set_err(err, err_size, "the NAM pedals have no target for %s (use the Anxiety OD hijack there)", target->name);
+      goto cleanup;
+    }
+    if (nam_pedals && spy->experimental)
+      report(progress, progress_user_data,
+             "!!  EXPERIMENTAL: the NAM%s pedals on the %s were derived from the Pedalboard's and have never run on a "
+             "device",
+             reverb_pedal ? " and Reverb" : "", target->name);
 
     if (anxiety_hijack)
     {
@@ -248,7 +263,8 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
       {
         if (!nam_qml_patch(evil_data, evil_len, target, err, err_size))
           goto cleanup;
-        report(progress, progress_user_data, "OK  QML knob labels relabeled");
+        /* No visible effect on hardware: see docs/TECHNICAL.md "What didn't make it in". */
+        report(progress, progress_user_data, "OK  QML knob-label bytes patched (no on-screen effect)");
       }
       else
       {
@@ -269,15 +285,46 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
       memset(grown + evil_len, 0, 4096);
       evil_data = grown;
       evil_len += 4096;
-      /* two registry pairs = two picker entries, each addable twice: four NAM pedals per rig */
-      const NamPair pairs[2] = {{"NAM", "NAM", NAM_ENGINE_TYPE, 0}, {"NAM TWO", "NAM TWO", NAM_ENGINE_TYPE, 0}};
-      if (!nam_elf_patch_registry(evil_data, evil_len, pairs, 2, err, err_size)
-          || !nam_elf_patch_node_registration(evil_data, evil_len, pairs, 2, &eng_init_slot, &eng_tab, err, err_size)
-          || !nam_elf_patch_engine_class(evil_data, evil_len, 4, eng_tab, &eng_hook_slot, err, err_size))
+      /* every pair shares the NAM engine class; the hook tells pedals apart by name (the Reverb pair; each NAM
+       * pedal's own quality mode): the engine stub records (engine, &name) when a pedal is created (record hook,
+       * always on) */
+      const NamPair pairs[3] = {{"NAM", "NAM", NAM_ENGINE_TYPE, 0},
+                                {"NAM TWO", "NAM TWO", NAM_ENGINE_TYPE, 0},
+                                {"Reverb", "Reverb", NAM_ENGINE_TYPE, 0, NAM_CAT_REVERB}};
+      const uint32_t npairs = reverb_pedal ? 3 : 2;
+      if (!nam_elf_patch_registry(spy, evil_data, evil_len, pairs, npairs, err, err_size)
+          || !nam_elf_patch_node_registration(spy, evil_data, evil_len, pairs, npairs, &eng_init_slot, &eng_tab, err,
+                                              err_size)
+          || !nam_elf_patch_engine_class(spy, evil_data, evil_len, 2 * npairs, eng_tab, true, &eng_hook_slot, err,
+                                         err_size))
         goto cleanup;
       report(progress, progress_user_data,
              "OK  NAM pedals registered: \"NAM\" and \"NAM TWO\" (2 instances each), engine hook_slot @ 0x%x",
              eng_hook_slot);
+      if (reverb_pedal)
+        report(progress, progress_user_data,
+               "OK  Reverb pedals registered: \"Reverb\" and \"Reverb 2\" in the Reverb list (Dattorro plate)");
+
+      if (!nam_qml_override_blockdetails(evil_data, evil_len, "file:///usr/Evil/Resources/pedal_ui.qml", err, err_size)
+          || !nam_qml_override_stomp(evil_data, evil_len, err, err_size))
+        goto cleanup;
+      qml_pages = true;
+      report(progress, progress_user_data,
+             "OK  detail pages: BlockDetails.qml loads /usr/Evil/Resources/pedal_ui.qml for the additive pedals; the "
+             "Rig page draws them");
+      /* the encoder tiles (real parameter names under the knobs) exist on the Pedalboard only: the MX5 and the
+       * Gigboard have no EncoderParamInfo.qml / EncoderField.qml source, their knobs keep the Glorious Drive names */
+      if (strcmp(target->name, "pedalboard") == 0)
+      {
+        if (!nam_qml_override_encoder_tile(evil_data, evil_len, err, err_size)
+            || !nam_qml_override_encoder_field(evil_data, evil_len, err, err_size))
+          goto cleanup;
+        report(progress, progress_user_data, "OK  EncoderParamInfo.qml shows their real parameter names on the tiles");
+      }
+      else
+        report(progress, progress_user_data,
+               "    (knob tiles keep the stock DRIVE / LEVEL / TONE captions on the %s: no tile source to edit)",
+               target->name);
     }
     evil_modified = true;
 
@@ -293,8 +340,8 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
       snprintf(hook_slot_v2_hex, sizeof(hook_slot_v2_hex), "0x%x", elf_result_v2.hook_slot_addr);
     if (!nam_build_launcher_script(script_data, anxiety_hijack ? hook_slot_hex : NULL,
                                     has_v2_hijack ? hook_slot_v2_hex : NULL, nam_pedals ? hook_slot_eng_hex : NULL,
-                                    nam_pedals ? eng_init_hex : NULL, nam_pedals ? eng_tab_hex : NULL, &new_script,
-                                    err, err_size))
+                                    nam_pedals ? eng_init_hex : NULL, nam_pedals ? eng_tab_hex : NULL, nam_pedals,
+                                    &new_script, err, err_size))
       goto cleanup;
     free(script_data);
     script_data = NULL;
@@ -306,6 +353,24 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
                           err, err_size))
       goto cleanup;
     report(progress, progress_user_data, "OK  injected libnam_hook.so, libnam_preload.so");
+    if (qml_pages)
+    {
+      if (!nam_ext4_inject(img, "/usr/Evil/Resources/pedal_ui.qml", g_ui_pedal_qml, (size_t)g_ui_pedal_qml_len, 0644,
+                           err, err_size)
+          || !nam_ext4_inject(img, "/usr/Evil/Resources/nam_ui.qml", g_ui_nam_qml, (size_t)g_ui_nam_qml_len, 0644, err,
+                              err_size)
+          || !nam_ext4_inject(img, "/usr/Evil/Resources/nam_fix.qml", g_ui_nam_fix_qml, (size_t)g_ui_nam_fix_qml_len,
+                              0644, err, err_size)
+          || !nam_ext4_inject(img, "/usr/Evil/Resources/pedal_art.qml", g_ui_pedal_art_qml,
+                              (size_t)g_ui_pedal_art_qml_len, 0644, err, err_size)
+          || !nam_ext4_inject(img, "/usr/Evil/Resources/rig_block.qml", g_ui_rig_block_qml,
+                              (size_t)g_ui_rig_block_qml_len, 0644, err, err_size)
+          || (reverb_pedal
+              && !nam_ext4_inject(img, "/usr/Evil/Resources/reverb_ui.qml", g_ui_reverb_qml,
+                                  (size_t)g_ui_reverb_qml_len, 0644, err, err_size)))
+        goto cleanup;
+      report(progress, progress_user_data, "OK  injected the detail pages (/usr/Evil/Resources/*_ui.qml)");
+    }
   }
   else if (want_launcher)
   {
@@ -346,6 +411,15 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
     evil_modified = true;
   }
 
+  if (getenv("NAM_DUMP_EVIL")) /* debugging aid: write the patched Evil next to the image (see docs/DEV_LOOP.md) */
+  {
+    FILE* df = fopen(getenv("NAM_DUMP_EVIL"), "wb");
+    if (df)
+    {
+      fwrite(evil_data, 1, evil_len, df);
+      fclose(df);
+    }
+  }
   if (evil_modified)
   {
     if (!nam_ext4_inject(img, "/usr/Evil/Evil", evil_data, evil_len, 0755, err, err_size))

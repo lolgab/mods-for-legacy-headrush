@@ -17,35 +17,24 @@ Code: `patch/nam_hook.cpp` (the "display" section at the end of the file,
 | Level | input volume          | dB, same scale as the FX-Loop *Return*    |
 | Tone  | output volume         | dB, same scale as the FX-Loop *Send*      |
 
-The captions (DRIVE / LEVEL / TONE) cannot be changed; see "Dead ends".
+The editor shows these as MODEL / INPUT / OUTPUT (and the Gain switch as CALIB OFF / ON): the captions are swapped
+at install time by the QML edit in [QML_PAGES.md](QML_PAGES.md). Renaming the parameters themselves does not work;
+see "Dead ends".
 
 ## How the UI gets its text
 
-Every pedal parameter is a *MixerCtrl property*. Per pedal instance there are
-two twin sets of objects, one under `/Engine/MixerCtrl/<pedal>/<param>` and one
-under `/Engine/MixerCtrl2/<pedal>/<param>`.
-
-```
-prop            vtable 0x2b96734 (all MixerCtrl props)
-  +0x2c  cb     control block; its vtable tells float props (0x2b99d40)
-                from enum props (0x2b98fb4)
-  +0x30  std::string { ptr, len }   the path, e.g. "/Engine/MixerCtrl/NAM/Drive"
-cb  +0x20  -> desc  (translator / descriptor)
-desc (0x58 bytes for float params)
-  +0x00  use count (0 idle, ~6 while the editor holds it)
-  +0x18  current value, normalized 0..1          (+0x20 holds a copy)
-  +0x1c  default (0.5)                            (+0x24 holds a copy)
-  +0x28  min      +0x2c  max      +0x30  step
-  +0x38  inline format string, 32 bytes, e.g. "%.0f %%", "%.1f dB"
-```
+Every pedal parameter is a *MixerCtrl property*, one under
+`/Engine/MixerCtrl/<pedal>/<param>` and a twin under
+`/Engine/MixerCtrl2/<pedal>/<param>`. Each property points at a descriptor
+("desc") that holds the normalized value (0..1), the default, min, max, step
+and a format string such as `"%.0f %%"` or `"%.1f dB"`.
 
 The UI turns the normalized value into the text it shows as
-`min + v * (max - min)` formatted with the string at `+0x38`. Nothing else
-is consulted, so changing `min`, `max`, `step` and the string is enough to
-re-skin a fader. The FX-Loop *Return* / *Send* descs are the stock dB faders
-(min -60, max +12, step 0.1, `"%.1f dB"`, default 0.8333). The NAM pedals
-are clones of Glorious Drive and start with percent descs (0..100,
-`"%.0f %%"`).
+`min + v * (max - min)` formatted with that string. Nothing else is consulted,
+so changing min, max, step and the format is enough to re-skin a fader. The
+FX-Loop *Return* / *Send* descs are the stock dB faders (min -60, max +12, step
+0.1, `"%.1f dB"`). The NAM pedals are clones of Glorious Drive and start with
+percent descs (0..100, `"%.0f %%"`).
 
 Important: **the descs are not fixed objects.**
 
@@ -67,8 +56,8 @@ starts `display_watcher()` once. It:
    (the prop lives next to its path text). Cold, the first sweep takes about
    4 s (the boot model scan competes for the CPU); later sweeps about 160 ms.
    The whole-heap pointer scan this replaced took 4-8 s every time.
-2. **Level / Tone**: copies `desc+0x18..0x58` of the FX-Loop Return / Send
-   descs over each NAM Level / Tone desc (`clone_desc`). Only when
+2. **Level / Tone**: copies the value range and format of the FX-Loop Return /
+   Send descs over each NAM Level / Tone desc (`clone_desc`). Only when
    `desc_sane()` passes (use count <= 4096, defaults in [0,1], a known
    range, printable NUL-terminated fmt), because a freshly added pedal's
    half-built or freed memory also reads as valid zeros and writing there
@@ -78,14 +67,18 @@ starts `display_watcher()` once. It:
    max 28 chars, `%` escaped). The format keeps the leading `%.0f `; with a
    name-only format the knob stopped responding.
 4. **Between sweeps** a 2 ms loop follows `prop -> cb -> desc` for each known
-   Drive prop (`prop_desc()`), reads the value at `desc+0x18`, and re-patches
+   Drive prop (`prop_desc()`), reads the value, and re-patches
    as soon as the value or the file count changes. It must follow the prop to
    its *current* desc each tick: patching only the desc found at the last
    sweep lags by up to a second because the desc address changes per move.
-5. Sets `disp_db` on every engine instance when all NAM Level and Tone descs
-   read in dB, so the engine uses the matching gain curve
-   (`trim_gain_fx`: dB = -60 + 72x, silent at <= 0.4%) instead of the
-   percent curve.
+5. The engine's INPUT / OUTPUT gain always follows the dB readout
+   (`trim_gain_fx`: dB = -60 + 72x, silent at <= 0.4%), even while a fader
+   still shows percent (a few seconds after boot, or while a page is
+   rebuilt). It used to switch every NAM pedal to the old percent curve when
+   one fader stayed unconverted for a few seconds; the same fader position is
+   up to 24 dB louder there, on input and output at once, which is what made
+   the volume jump "for no reason". The journal still says which readout the
+   faders show (`[nam_disp] NAM INPUT / OUTPUT faders read in dB|PERCENT`).
 
 ### File list at boot
 
@@ -109,7 +102,7 @@ The slow, fragile part of the first versions. The module only knows the pedal
 *type* ("NAM"), not which instance it is; instances were paired by engine
 creation order, and a module lookup by heap sweep took seconds and failed for
 new pedals ("adding pedal n updated pedal n-1"). The props keep their current
-value at `desc+0x18`, so none of it is needed any more: each Drive prop is
+value in their desc, so none of it is needed any more: each Drive prop is
 patched from its own value, independent of the engines.
 
 ## Registration (additive pedals)
@@ -122,36 +115,24 @@ and the engine class. Relevant to display:
   filled from env vars by `libnam_preload.so`
   (`NAM_HOOK_SLOT_ENG_INIT_ADDR`, `NAM_ENG_TAB_ADDR`).
 * The parameter-name table (Glorious Drive's: Drive, Level, Tone, Gain,
-  Hi-Cut, On, Colour at vaddr 0x33ca244) is also used as a lookup key, which
+  Hi-Cut, On, Colour) is also used as a lookup key, which
   is why renaming it broke the display (below).
 
 ## Dead ends (do not retry)
 
-* **Changing the captions DRIVE / LEVEL / TONE.** The UI QML (and its compiled
-  cache) is embedded in `Evil`'s qrc. Patching the embedded QML is ignored on
-  hardware. Renaming the entries in the parameter-name table (experiment
-  `--rename-params`, build v29: "Model" / "OutVol" / "InVol", registration
-  blob copies the 7-word table into the RW tail and repoints it) keeps the old
-  captions and **removes the numbers**: the editor looks parameters up by
-  their original names. Same failure as renaming the pedal title.
-* **Reusing the Gain LOW/HIGH switch for the model list.** `Gain` is an *enum*
-  prop (cb vtable 0x2b98fb4). Its desc has 160 bytes with 32-byte name slots
-  at `+0x1c`, `+0x3c`, `+0x5c`, `+0x7c`. The only builder (`0x5a74b0`, 31
-  callers) fills exactly two names and leaves "Unassigned" in the third. The
-  names are static, so an enum would have no formatting lag, but it holds at
-  most 2 (maybe 4) names and the widget is a switch. A model library of 9+
-  files does not fit. Making Drive an enum would need a bigger enum
-  desc + callback, an index-valued engine knob and a UI that accepts more than
-  two states (*unverified*); not attempted.
-* **Hooking the text formatter.** Probing `vsnprintf` / `snprintf` through the
-  preload (the hook lib is `RTLD_GLOBAL`) never fired for knob text: Qt
-  formats the float itself (statically linked `QString::asprintf`,
-  `doubleToString`), no libc call to interpose. The `sprintf` callers in
-  `Evil` are unrelated (ALSA names, JSON escaping).
-* **Nudging the value to make the UI repaint.** Briefly writing `v + 1e-4` to
-  `desc+0x18/+0x20` and restoring it did not repaint the text.
-* **Fixed-width name column.** The format string is 31 characters inline; a
-  name longer than ~24 chars is truncated and the editor shrinks long text.
+* **Renaming the parameters to change the captions.** (The captions are now
+  changed in QML instead, see [QML_PAGES.md](QML_PAGES.md).) Renaming the parameter-name table
+  (`--rename-params`, build v29) kept the old captions and **removed the
+  numbers**: the editor looks parameters up by their original names. Same
+  failure as renaming the pedal title.
+* **Reusing the Gain LOW/HIGH switch for the model list.** It is a two-state
+  enum switch; a model library of 9+ files does not fit. Not attempted.
+* **Hooking the text formatter.** Qt formats the number itself; probing
+  `vsnprintf` / `snprintf` through the preload never fired for knob text.
+* **Nudging the value to make the UI repaint.** A tiny write-and-restore of the
+  value did not repaint the text.
+* **Fixed-width name column.** The format string holds 31 characters; a name
+  longer than ~24 chars is truncated and the editor shrinks long text.
 
 ## Known limits
 

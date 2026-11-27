@@ -1,7 +1,8 @@
 # Technical design: the Anxiety OD hijack
 
 > This is the **opt-in, older** design (the installer's "Also make Anxiety OD
-> run NAM" option; the only mode on MX5 and Gigboard). The default on the
+> run NAM" option; the default on MX5 and Gigboard, where the NAM pedals are
+> experimental). The default on the
 > Pedalboard is two new pedals, **NAM** and **NAM TWO** (two instances each), that replace nothing:
 > see [ADDITIVE_PEDAL.md](ADDITIVE_PEDAL.md) and
 > [NAM_PEDAL_DISPLAY.md](NAM_PEDAL_DISPLAY.md). Both can be installed together;
@@ -40,7 +41,27 @@ everything on the board. Measured on the Pedalboard with the NAM pedals:
   about **680 us** per channel for the large one and about **104 us** for the
   small one. Calibration picks the largest that fits a per-instance budget
   (`1000 us / running instances`, with a 50% safety margin) and in practice
-  always lands on the small one.
+  always lands on the small one. This is the original rule, still used for
+  Anxiety OD.
+- **NAM quality** (AUTO / LITE / FULL buttons on a NAM pedal's detail page,
+  one mode per pedal name, saved in `<model dir>/nam_quality.txt` as
+  `NAM 2=full` lines; see `namespace quality` in `patch/nam_hook.cpp`). The
+  hook knows an engine's pedal name from `nam_eng_record`, which the engine
+  stub calls when a pedal is created (the record hook, installed in every
+  build with the NAM pedals; the older `{engine, &name}` table pointed at a
+  temporary and can't be used); an engine with no recorded name runs AUTO. Anxiety OD keeps the rule
+  above. **AUTO** calibrates with 1 channel (the dual-mono case below) and a
+  75% margin, so a single NAM gets Full (~680 us) and two get Lite; while on
+  Full, a watchdog drops it to Lite after ~50 ms of stereo input or 3 blocks
+  over 850 us (this pedal's own time) within 2 s, until AUTO is picked again.
+  **LITE** / **FULL** fix the size: no calibration, no reload when an instance
+  joins. Full fits one active NAM on a mono input with Tails **off** (with
+  Tails on, a rig change keeps the old rig running: two NAMs at once). The
+  page talks to the hook through files: a button loads
+  `/tmp/nam_mode/<pedal, spaces as _>-<mode>.png` (the hook watches the opens
+  with inotify) and the hook writes every pedal's mode to
+  `/tmp/nam_mode_state.qml`. `patch/test_nam_quality.c`
+  exercises it all on ARM. Confirmed on a Pedalboard.
 - Each instance runs one model per channel. Run as two channels, an instance
   costs ~250 us per block, so **three active NAMs (~780 us) overran** while two
   (~520 us) did not; the symptom was crackle until a scene deactivated one.
@@ -78,9 +99,9 @@ With Hi-Lo on, the input is scaled by `interface_dBu - model_input_level_dBu` (t
 `.nam` metadata; `NAM_CAL_LOUDNESS_DB` overrides the target, same ±24 dB cap, models without it untouched), with Level
 trim on top. The NAM pedals have the same
 calibration: their equivalent of the Hi-Lo switch is the stock **Gain Low/High** switch, **High = on**, off by default.
-**Verified on hardware:** on the NAM pedals the switch is the low byte of the word at engine offset `0x57c` (the word
-reads `0x00010000` off and `0x00010001` on, other flags share it, so the byte is tested, not the whole word). **Unverified
-on hardware:** the Anxiety OD offset (`0x55c`; `NAM_HILO_OFFSET` overrides either) and the 12.2 dBu reference.
+**Verified on hardware:** on the NAM pedals the switch is an engine flag (other flags share its word, so only the
+switch's own byte is tested). **Unverified on hardware:** the Anxiety OD flag's location (`NAM_HILO_OFFSET` overrides
+either) and the 12.2 dBu reference.
 
 The Model knob has a fixed 101 positions (0%-100%, one per whole percent).
 Each position selects one `.nam` file, in alphabetical order, starting at 0%:
@@ -206,10 +227,6 @@ real-time audio thread.
   **disabled** — real-hardware testing showed renaming that string breaks
   the pedal entirely (it's very likely used as an internal type-name lookup
   key, not just a label).
-
-See [`ADDITIVE_PEDAL.md`](ADDITIVE_PEDAL.md) for a second, non-hijacking
-pedal design that was researched but never shipped (unreachable from the
-firmware's own UI).
 
 ## Repo layout
 

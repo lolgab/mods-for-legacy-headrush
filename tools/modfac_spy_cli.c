@@ -61,9 +61,10 @@ int main(int argc, char** argv)
   uint64_t meta_mask = 0x1ffffffffffffull;
   NamPair pairs[NAM_MAX_PAIRS];
   uint32_t npairs = 0;
+  const char* model = "pedalboard";
   if (argc < 3)
-    die("usage: %s <in.img> <out.img> [--registry-test NAME SHORT TYPE] [--metacall-spy [IDX,IDX,..]] "
-        "[--node-reg] [--no-modfac-spy]",
+    die("usage: %s <in.img> <out.img> [--model pedalboard|mx5|gigboard] [--registry-test NAME SHORT TYPE] "
+        "[--metacall-spy [IDX,IDX,..]] [--node-reg] [--no-modfac-spy]",
         argv[0]);
   for (int i = 3; i < argc; ++i)
   {
@@ -100,10 +101,15 @@ int main(int argc, char** argv)
       node_reg = true;
     else if (strcmp(argv[i], "--no-modfac-spy") == 0)
       modfac_spy = false;
+    else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc)
+      model = argv[++i];
     else
       die("unknown argument: %s", argv[i]);
   }
 
+  const SpyTarget* st = nam_spy_target(model);
+  if (!st)
+    die("no additive-pedal target for model %s", model);
   char err[1024] = "";
   char workdir[NAM_TEMPDIR_MAX_PATH];
   if (!nam_make_temp_dir(workdir, sizeof(workdir), err, sizeof(err)))
@@ -156,21 +162,21 @@ int main(int argc, char** argv)
   if (modfac_spy)
   {
     uint32_t tramp;
-    if (!nam_elf_patch_modfac_spy(evil, evil_len, &tramp, err, sizeof(err)))
+    if (!nam_elf_patch_modfac_spy(st, evil, evil_len, &tramp, err, sizeof(err)))
       die("%s", err);
     printf("OK  ModFac vtable slot 7 -> trampoline @ 0x%x\n", tramp);
   }
   /* registry first: it needs the largest contiguous run of the code cave */
   if (npairs)
   {
-    if (!nam_elf_patch_registry(evil, evil_len, pairs, npairs, err, sizeof(err)))
+    if (!nam_elf_patch_registry(st, evil, evil_len, pairs, npairs, err, sizeof(err)))
       die("%s", err);
     for (uint32_t p = 0; p < npairs; ++p)
       printf("OK  registry: added \"%s\" / \"%s 2\" as type %u\n", pairs[p].name, pairs[p].name, (unsigned)pairs[p].type_idx);
   }
   if (node_reg && npairs)
   {
-    if (!nam_elf_patch_node_registration(evil, evil_len, pairs, npairs, NULL, NULL, err, sizeof(err)))
+    if (!nam_elf_patch_node_registration(st, evil, evil_len, pairs, npairs, NULL, NULL, err, sizeof(err)))
       die("%s", err);
     printf("OK  property nodes registered for %u pair(s)\n", (unsigned)npairs);
   }
@@ -190,7 +196,7 @@ int main(int argc, char** argv)
   }
   if (meta_spy)
   {
-    if (!nam_elf_patch_metacall_spy(evil, evil_len, meta_mask, err, sizeof(err)))
+    if (!nam_elf_patch_metacall_spy(st, evil, evil_len, meta_mask, err, sizeof(err)))
       die("%s", err);
     printf("OK  metacall spy installed (mask 0x%llx)\n", (unsigned long long)meta_mask);
   }

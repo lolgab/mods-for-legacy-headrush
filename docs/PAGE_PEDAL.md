@@ -4,7 +4,7 @@ Optional, **Pedalboard only**. Turns two footswitches into a USB keyboard for
 the computer the Pedalboard is plugged into: **Page Down** and **Page Up**, so
 you can turn pages in a PDF (sheet music, lyrics) with your foot.
 
-Enable it with the **Footswitch page-turner** checkbox in `headrush-nam-gui`,
+Enable it with the **Footswitch page-turner** checkbox in `nam-mod-gui`,
 or `--page-pedal` on `gui-core-cli`. It is independent of the NAM options and
 is installed on top of them.
 
@@ -17,8 +17,8 @@ is installed on top of them.
 
 | Footswitch | Sends |
 |---|---|
-| 5th from the left, **upper** row | Page Down |
-| 5th from the left, **lower** row | Page Up |
+| 5th from the left, **upper** row (FS5) | Page Up |
+| 5th from the left, **lower** row (FS11) | Page Down |
 
 Plug the Pedalboard into the computer with a USB **data** cable (the
 "computer" port). In normal mode it shows up as a keyboard named
@@ -35,11 +35,11 @@ Held down, a switch repeats the way a held keyboard key does.
 ## Labels and colours
 
 With the mod installed, the two switches also *look* the part: the footswitch
-LED of **Page Down** is **blue** and the one of **Page Up** is **white**, always
-lit, and their small screens read **PAGE DOWN** and **PAGE UP** instead of what
+LEDs of **Page Down** and **Page Up** are both **light blue** (the panel's
+`LEDColour10`, the colour Page Up had before), always lit, and their small screens read **PAGE DOWN** and **PAGE UP** instead of what
 the rig assigns to them (the rig's own colour and label for those two switches
 are overridden). The other ten switches are untouched. Verified on a real
-Pedalboard: the strips and LEDs change as described (the 128x32 text is drawn
+Pedalboard, when Page Down was still blue: the strips and LEDs change as described (the 128x32 text is drawn
 at 23 px on one line; two lines at 16 px were too small).
 
 The labels follow the same two notes as the keys. They are fixed when the image
@@ -50,15 +50,16 @@ also writes the notes to `/usr/Evil/pagepedal.conf`, so keys and labels agree. A
 `PagePedal.conf` on the USB drive (see Calibrating) still moves the *keys* at
 runtime but not the labels: rebuild if you change the notes for good.
 
-## Calibrating (which physical switch is which)
+## Calibrating (moving the keys to other switches)
 
-The factory firmware numbers the 12 switches FS1-FS12 (panel notes 0-11), but
-which of those is the upper or lower row is not stated anywhere in the
-firmware, so the defaults are a guess: **FS5 (note 4) = lower row = Page Up,
-FS11 (note 10) = upper row = Page Down**.
+The factory firmware numbers the 12 switches FS1-FS12 (panel notes 0-11):
+FS1-FS6 are the upper row and FS7-FS12 the lower one, left to right, so the
+defaults are **FS5 (note 4) = upper row = Page Up, FS11 (note 10) = lower row
+= Page Down** (confirmed on a real Pedalboard).
 
-To check, create a text file named **`PagePedal.conf`** on the Pedalboard's USB
-drive (the same top-level folder as `NAM`, `Blocks`, `Rigs` ...) containing:
+To find a switch's number, create a text file named **`PagePedal.conf`** on
+the Pedalboard's USB drive (the same top-level folder as `NAM`, `Blocks`,
+`Rigs` ...) containing:
 
 ```
 learn=1
@@ -66,8 +67,7 @@ learn=1
 
 Reboot the Pedalboard, open any text editor on the computer and press the
 footswitches: FS1 types `a`, FS2 types `b` ... FS12 types `l`. Find the two
-letters that belong to the 5th-from-left upper and lower switches, then
-replace the file's contents with their note numbers (`a`=0, `b`=1, ... `l`=11):
+letters that belong to the switches you want, then replace the file's contents with their note numbers (`a`=0, `b`=1, ... `l`=11):
 
 ```
 page_down_note=10
@@ -147,6 +147,5 @@ computer in USB-drive mode); its log is `/tmp/pagepedal.log` on the device.
 - That the panel's MIDI really shows up as a kernel ALSA-sequencer client
   (the daemon logs what it subscribes to, and also tries userspace clients
   if it finds no kernel one).
-- The upper/lower row numbering (see Calibrating).
 - That the audio-interface gadget binds with the extra HID interface on this
   controller (if not, the fallback above makes it behave as stock).

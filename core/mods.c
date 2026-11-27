@@ -1,15 +1,19 @@
 /* mods.c -- see mods.h. */
 #include "mods.h"
 
+#include "spy_patch.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
-/* Model lists are what has been verified, not what might work. The NAM
- * pedals and the page-turner were built and tested on the Pedalboard; the
- * MX5 mods (console, remote screen, tuner tempo) on MX5 2.7 hardware only.
- * mods/README.md covers what porting the MX5 mods to the other models
- * needs. */
+/* Model lists are what has been verified, not what might work, with one
+ * exception: the NAM and Reverb pedals were built and tested on the
+ * Pedalboard and are also offered on the MX5 / Gigboard as EXPERIMENTAL
+ * (never run there, see nam_mod_is_experimental). The page-turner was tested
+ * on the Pedalboard; the MX5 mods (console, remote screen, tuner tempo) on
+ * MX5 2.7 hardware only. mods/README.md covers what porting the MX5 mods to
+ * the other models needs. */
 const NamModInfo NAM_MODS[NAM_MOD_COUNT] = {
   {
     .id = NAM_MOD_NAM_PEDALS,
@@ -17,8 +21,17 @@ const NamModInfo NAM_MODS[NAM_MOD_COUNT] = {
     .title = "Add the NAM pedals (\"NAM\", \"NAM TWO\": four per rig)",
     .description = "Adds two new pedals to the Distortion list that play Neural Amp Modeler models. Nothing stock "
                    "is changed.",
-    .models = {"pedalboard"},
+    .models = {"pedalboard", "mx5", "gigboard"},
     .requires = NAM_MOD_COUNT,
+  },
+  {
+    .id = NAM_MOD_REVERB_PEDAL,
+    .key = "reverb-pedal",
+    .title = "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\")",
+    .description = "Adds two reverb pedals (Plate / Hall / Room / Spring) to the Reverb list, built on the NAM pedals. "
+                   "See docs/REVERB_PEDAL.md. On the Pedalboard, not together with the Anxiety OD hijack.",
+    .models = {"pedalboard", "mx5", "gigboard"},
+    .requires = NAM_MOD_NAM_PEDALS,
   },
   {
     .id = NAM_MOD_ANXIETY,
@@ -40,7 +53,7 @@ const NamModInfo NAM_MODS[NAM_MOD_COUNT] = {
   {
     .id = NAM_MOD_PAGE_PEDAL,
     .key = "page-pedal",
-    .title = "Footswitch page-turner (FS5/FS11 -> USB Page Down/Up)",
+    .title = "Footswitch page-turner (FS5/FS11 -> USB Page Up/Down)",
     .description = "Two footswitches act as a USB keyboard's Page Up/Page Down for the connected computer, e.g. "
                    "to turn sheet-music pages. See docs/PAGE_PEDAL.md.",
     .models = {"pedalboard"},
@@ -88,7 +101,8 @@ NamModSelection nam_mods_default(const char* model_name)
 {
   NamModSelection sel;
   memset(&sel, 0, sizeof(sel));
-  if (model_name && nam_mod_supports_model(&NAM_MODS[NAM_MOD_NAM_PEDALS], model_name))
+  const NamModInfo* pedals = &NAM_MODS[NAM_MOD_NAM_PEDALS];
+  if (model_name && nam_mod_supports_model(pedals, model_name) && !nam_mod_is_experimental(pedals, model_name))
     sel.enabled[NAM_MOD_NAM_PEDALS] = true;
   else
     sel.enabled[NAM_MOD_ANXIETY] = true;
@@ -109,6 +123,14 @@ bool nam_mod_supports_model(const NamModInfo* mod, const char* model_name)
     if (strcmp(mod->models[i], model_name) == 0)
       return true;
   return false;
+}
+
+bool nam_mod_is_experimental(const NamModInfo* mod, const char* model_name)
+{
+  if (mod->id != NAM_MOD_NAM_PEDALS && mod->id != NAM_MOD_REVERB_PEDAL)
+    return false;
+  const SpyTarget* spy = nam_spy_target(model_name);
+  return !spy || spy->experimental;
 }
 
 const char* nam_mod_models_str(const NamModInfo* mod)
@@ -144,6 +166,12 @@ bool nam_mods_validate(const NamModSelection* sel, const char* model_name, char*
       set_err(err, err_size, "mod '%s' requires mod '%s' -- select both", mod->key, NAM_MODS[mod->requires].key);
       return false;
     }
+  }
+  if (sel->enabled[NAM_MOD_REVERB_PEDAL] && sel->enabled[NAM_MOD_ANXIETY] && strcmp(model_name, "pedalboard") == 0)
+  {
+    /* the registry tables of three pairs plus the hijack trampolines overflow the Pedalboard's code cave */
+    set_err(err, err_size, "on the Pedalboard the Reverb pedals and the Anxiety OD hijack don't fit together: pick one");
+    return false;
   }
   if (!any)
   {

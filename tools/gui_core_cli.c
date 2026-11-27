@@ -6,18 +6,23 @@
  * by CI, see docs/BUILDING.md.
  *
  * usage: gui-core-cli <stock.img> <out.img> --model pedalboard|mx5|gigboard
- *                      [--mods LIST] [--anxiety-hijack] [--instances 2|4] [--no-nam-pedals]
- *                      [--page-pedal [--page-down-note N] [--page-up-note N]] [--keep-work-dir]
+ *                      [--mods LIST] [--anxiety-hijack] [--instances 2|4] [--nam-pedals | --no-nam-pedals]
+ *                      [--reverb-pedal] [--page-pedal [--page-down-note N] [--page-up-note N]] [--keep-work-dir]
  *        gui-core-cli --list-mods
  *
  * Without --mods, the model's default is installed: the "NAM" and "NAM TWO"
- * pedals on the Pedalboard, the Anxiety OD hijack elsewhere. --mods takes an
- * exact comma-separated list of mod keys instead (see --list-mods). The other
- * flags adjust either one: --anxiety-hijack adds the Anxiety OD hijack,
- * --instances 4 adds the Anxiety OD V2 hijack too, --no-nam-pedals drops the
- * NAM pedals (without --mods, the Anxiety OD hijack replaces them), and
- * --page-pedal adds the footswitch page-turner.
+ * pedals on the Pedalboard, the Anxiety OD hijack on the MX5 and Gigboard.
+ * --mods takes an exact comma-separated list of mod keys instead (see
+ * --list-mods). The other flags adjust either one: --anxiety-hijack adds the
+ * Anxiety OD hijack, --instances 4 adds the Anxiety OD V2 hijack too,
+ * --nam-pedals adds the NAM pedals (on the MX5 / Gigboard EXPERIMENTAL:
+ * derived from the Pedalboard's patches, never run on those devices; without
+ * --mods they replace the hijack there unless --anxiety-hijack is also
+ * given), --no-nam-pedals drops them (without --mods, the Anxiety OD hijack
+ * replaces them), --reverb-pedal adds the Reverb pedals (needs the NAM
+ * pedals), and --page-pedal adds the footswitch page-turner.
  */
+#include "model_targets.h"
 #include "mods.h"
 #include "patch_pipeline.h"
 #include "tempdir.h"
@@ -84,6 +89,15 @@ static void list_mods(void)
     printf("  %-14s %s\n", m->key, m->title);
     printf("  %-14s %s\n", "", m->description);
     printf("  %-14s models: %s", "", nam_mod_models_str(m));
+    bool first = true;
+    for (int k = 0; k < NAM_MOD_MAX_MODELS && m->models[k]; ++k)
+      if (nam_mod_is_experimental(m, m->models[k]))
+      {
+        printf("%s%s", first ? " (EXPERIMENTAL on " : ", ", m->models[k]);
+        first = false;
+      }
+    if (!first)
+      printf(")");
     if (m->requires != NAM_MOD_COUNT)
       printf("; requires: %s", NAM_MODS[m->requires].key);
     printf("\n\n");
@@ -114,8 +128,8 @@ int main(int argc, char** argv)
     }
 
   const char* usage = "usage: %s <stock.img> <out.img> --model pedalboard|mx5|gigboard [--mods LIST] "
-                      "[--anxiety-hijack] [--instances 2|4] [--no-nam-pedals] [--page-pedal [--page-down-note N] "
-                      "[--page-up-note N]] [--keep-work-dir]\n       %s --list-mods";
+                      "[--anxiety-hijack] [--instances 2|4] [--nam-pedals | --no-nam-pedals] [--reverb-pedal] "
+                      "[--page-pedal [--page-down-note N] [--page-up-note N]] [--keep-work-dir]\n       %s --list-mods";
   if (argc < 3)
     die(usage, argv[0], argv[0]);
 
@@ -127,7 +141,8 @@ int main(int argc, char** argv)
   int instances = 2;
   bool page_pedal = false;
   bool anxiety_hijack = false;
-  bool no_nam_pedals = false;
+  bool no_nam_pedals = false, nam_pedals_flag = false;
+  bool reverb_pedal = false;
   int page_down_note = -1, page_up_note = -1; /* -1 = the default */
 
   for (int i = 3; i < argc; ++i)
@@ -150,6 +165,10 @@ int main(int argc, char** argv)
       anxiety_hijack = true;
     else if (strcmp(argv[i], "--no-nam-pedals") == 0)
       no_nam_pedals = true;
+    else if (strcmp(argv[i], "--nam-pedals") == 0)
+      nam_pedals_flag = true;
+    else if (strcmp(argv[i], "--reverb-pedal") == 0)
+      reverb_pedal = true;
     else if (strcmp(argv[i], "--page-pedal") == 0)
       page_pedal = true;
     else if (strcmp(argv[i], "--page-down-note") == 0 && i + 1 < argc)
@@ -165,6 +184,8 @@ int main(int argc, char** argv)
   if (!model_name)
     die("--model is required (pedalboard|mx5|gigboard) -- no default target");
 
+  if (nam_pedals_flag && no_nam_pedals)
+    die("--nam-pedals and --no-nam-pedals contradict each other");
   NamPatchOptions opts;
   memset(&opts, 0, sizeof(opts));
   NamModSelection* mods = &opts.mods;
@@ -172,6 +193,13 @@ int main(int argc, char** argv)
     parse_mods(mods_list, mods);
   else
     *mods = nam_mods_default(model_name);
+  if (nam_pedals_flag)
+  {
+    /* the NAM pedals are the Pedalboard's default; on the MX5 and the Gigboard they are experimental and opt-in */
+    mods->enabled[NAM_MOD_NAM_PEDALS] = true;
+    if (!mods_list) /* --nam-pedals on its own replaces the default hijack; --anxiety-hijack below keeps it */
+      mods->enabled[NAM_MOD_ANXIETY] = false;
+  }
   if (anxiety_hijack || instances == 4)
     mods->enabled[NAM_MOD_ANXIETY] = true; /* the V2 hijack only exists on top of the Anxiety OD one */
   if (instances == 4)
@@ -182,6 +210,10 @@ int main(int argc, char** argv)
     if (!mods_list) /* --no-nam-pedals on its own means "hijack only" */
       mods->enabled[NAM_MOD_ANXIETY] = true;
   }
+  if (reverb_pedal)
+    mods->enabled[NAM_MOD_REVERB_PEDAL] = true;
+  if (reverb_pedal && !mods->enabled[NAM_MOD_NAM_PEDALS]) /* with --mods, nam_mods_validate says it */
+    die("--reverb-pedal needs the NAM pedals (default on the Pedalboard, --nam-pedals on the MX5 / Gigboard)");
   if (page_pedal)
     mods->enabled[NAM_MOD_PAGE_PEDAL] = true;
   if (page_down_note >= 0 || page_up_note >= 0)
@@ -201,6 +233,16 @@ int main(int argc, char** argv)
 
   size_t input_len;
   uint8_t* input_data = read_whole_file(input_img, &input_len);
+
+  /* the GUI refuses anything but the tested stock image; the CLI also takes dev bases (USB console builds), so it
+   * only says which one it got */
+  const ModelTarget* target = nam_select_target(model_name, NULL, NULL);
+  char hex[65] = "?";
+  if (target && nam_is_known_stock_img(target, input_data, input_len, hex))
+    printf("OK  input is the tested stock %s 2.7 image (sha256 %.12s...)\n", model_name, hex);
+  else
+    printf("note: input is not the tested stock %s 2.7 image (sha256 %.12s...); the GUI would refuse it\n", model_name,
+           hex);
 
   uint8_t* out_data;
   size_t out_len;
@@ -228,6 +270,8 @@ int main(int argc, char** argv)
   printf("\nOK  applied mods: %s\n", nam_mods_selection_str(mods));
   if (mods->enabled[NAM_MOD_NAM_PEDALS])
     printf("    NAM pedals: \"NAM\" and \"NAM TWO\" in the Distortion list, two instances each.\n");
+  if (mods->enabled[NAM_MOD_REVERB_PEDAL])
+    printf("    Reverb pedals: \"Reverb\" and \"Reverb 2\" in the Reverb list (see docs/REVERB_PEDAL.md).\n");
   if (mods->enabled[NAM_MOD_PAGE_PEDAL])
     printf("    Footswitch page-turner: FS%d -> Page Down, FS%d -> Page Up (see docs/PAGE_PEDAL.md).\n",
            (opts.page_notes_set ? opts.page_down_note : 10) + 1, (opts.page_notes_set ? opts.page_up_note : 4) + 1);

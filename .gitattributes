@@ -1,10 +1,13 @@
-# Shell scripts must keep LF endings on every checkout (they run under bash,
-# including MSYS2's on Windows CI).
+# Text payloads embedded with bin2c are installed on the device byte for
+# byte, so they must keep LF endings on every checkout. GitHub's Windows
+# runners check out with core.autocrlf, which otherwise turns
+# patch/pagepedal-usb.sh into "#!/bin/sh\r" and the device can't run it.
 *.sh text eol=lf
+*.qml text eol=lf
 
 # Everything under mods/ is either installed verbatim on the device (scripts,
 # systemd units) or patched in byte-for-byte (Tuner_mx5.qml must be exactly
 # as long as the source it replaces). Never convert line endings here: a
-# Windows checkout with core.autocrlf (the default on GitHub's Windows
-# runners) would otherwise embed CRLF payloads into the installer.
+# Windows checkout with core.autocrlf would otherwise embed CRLF payloads into
+# the installer. (Later lines win, so this overrides the two above for mods/.)
 mods/** -text

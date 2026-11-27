@@ -17,3 +17,12 @@ __pycache__/
 # remote-screen dev-loop outputs (regenerate with mods/remote_screen/build.sh)
 /mods/remote_screen/mx5_screen_server
 /mods/remote_screen/mx5_screen_server.deploy.sh
+
+# dev tooling virtualenv (tools/hrdev.py)
+tools/.venv/
+
+# updaters the GUI writes to the current directory -- they contain HeadRush firmware, never commit them
+*.app/
+*.exe
+
+/notes/

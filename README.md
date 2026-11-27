@@ -1,8 +1,20 @@
-# HeadRush Pedalboard, MX5 & Gigboard — Neural Amp Modeler (NAM) mod
+# NAM mod for HeadRush Pedalboard, MX5 & Gigboard — Neural Amp Modeler (NAM)
 
-Reverse-engineered firmware mod for the HeadRush Pedalboard, MX5, and Gigboard, adding
-[Neural Amp Modeler](https://github.com/sdatkinson/NeuralAmpModelerCore)
-(NAM, MIT-licensed) neural-network amp-model inference as a pedal.
+Run [Neural Amp Modeler](https://github.com/sdatkinson/NeuralAmpModelerCore)
+(NAM, MIT-licensed) amp and pedal captures on the HeadRush Pedalboard, MX5 and
+Gigboard: an installer that adds NAM to your device's firmware, as new pedals
+on the Pedalboard or in place of the Anxiety OD pedal on every model.
+
+> **Unofficial.** This is an independent community project. It is not
+> affiliated with, endorsed by, or supported by inMusic or HeadRush; "HeadRush",
+> "Pedalboard", "MX5" and "Gigboard" are used only to say which devices it
+> works with, and remain the trademarks of their owners. This repository and its
+> releases contain no HeadRush firmware: the installer downloads the official
+> updater from HeadRush on your machine and patches your own copy there, so that
+> NAM models can run on hardware you own. Flashing modified firmware can brick
+> your device and may void its warranty, and HeadRush's own license terms may
+> not allow modifying its firmware: whether to use it is your decision, at your
+> own risk (see [Disclaimer](#disclaimer)).
 
 **Status**: on the Pedalboard, two real NAM pedals, **NAM** and **NAM TWO**, are
 added to the Distortion list next to the stock pedals; each can be added twice,
@@ -12,32 +24,35 @@ NAM, so existing pedalboards that use it keep working. See below.
 
 ## Install
 
-1. Download `headrush-nam-gui` for your OS from the
-   [GitHub Releases page](https://github.com/lolgab/headrush-nam-mod/releases).
+1. Download `nam-mod-gui` for your OS from the
+   [GitHub Releases page](https://github.com/lolgab/mods-for-legacy-headrush/releases).
    **Windows**: it's a `.zip` — unzip it and keep the `.exe` together with
    the `.dll` files next to it; they're required, not optional.
-   **macOS**: it dynamically links SDL2 (and, on Intel Macs, curl and xz
-   too) from Homebrew — install whichever your Mac needs before running it:
-   - **Apple Silicon**: `brew install sdl2`
-   - **Intel**: `brew install curl xz sdl2`
-
-   Without these, `headrush-nam-gui` fails to launch with a
-   `Library not loaded` error.
+   **macOS**: one universal binary (Apple Silicon and Intel), nothing
+   else to install. It isn't notarized: if macOS refuses to open it (or the
+   patched updater it builds), right-click it and choose **Open**, or allow it
+   in System Settings → Privacy & Security.
+   **Linux**: the GUI builds a plain `Update_nam.img`. HeadRush ships no Linux
+   updater to flash it with, so to flash from Linux use the Windows build in a
+   VM with USB passthrough, or another computer.
 2. Run it, pick your model (Pedalboard, MX5, or Gigboard), tick the mods you
    want, and click **Install** — it downloads the official HeadRush firmware
    updater and builds a patched copy of it in the current directory. On the
    Pedalboard the NAM pedals are selected by default; also tick **Make Anxiety
    OD run NAM** if you have pedalboards that use Anxiety OD as the NAM engine
-   and want to keep them (see "The pedals" below). MX5 and Gigboard don't have
-   the NAM pedals yet and default to the Anxiety OD design. See "Optional mods"
-   below for the rest; every mod, NAM included, can be left out.
+   and want to keep them (see "The pedals" below). MX5 and Gigboard default to
+   the Anxiety OD design; their NAM pedals are **experimental** (see "NAM
+   pedals on the MX5 and Gigboard" below). See "Optional mods" below for the
+   rest; every mod, NAM included, can be left out. **Install** stays disabled
+   until you tick **I own this device and accept the risk**.
 3. Put your device in firmware-update mode. See
    [this video](https://www.youtube.com/watch?v=6H90kbOCJG8) for a
    walkthrough.
 4. Run the patched updater it just built:
-   - **macOS**: the patched `.app` it wrote — double-click it like the
-     official updater.
-   - **Windows**: the patched `.exe` it wrote — run it like the official
+   - **macOS**: the patched `NAM mod for HeadRush … Firmware Updater.app`
+     it wrote — double-click it like the official updater.
+   - **Windows**: the patched `NAM mod for HeadRush … Firmware Updater.exe`
+     it wrote — run it like the official
      updater (unsigned, so SmartScreen may warn about an unrecognized
      publisher — expected for any unofficial build).
 
@@ -49,14 +64,20 @@ on the first download and checked every time; a file that no longer matches
 (truncated, corrupted, edited) is discarded and downloaded afresh. Delete the
 folder, or set `NAM_NO_CACHE=1`, to force a fresh download.
 
-Keep the unmodified updater the tool leaves alongside the patched one — you
+The installer only patches the exact 2.7 firmware it was tested with: the
+firmware image inside the updater must match a known SHA-256 for your model.
+If HeadRush publishes a different version, or the download is damaged, it
+stops without patching anything.
+
+Keep the unmodified updater the tool leaves alongside the patched one (the
+`… (stock)` copy) — you
 need it to recover if a flash goes wrong (see
 [docs/RECOVERY.md](docs/RECOVERY.md)).
 
 ## Loading models
 
 Drop `.nam` files into their own **`/NAM`** folder on the device's USB drive
-(sibling to `Impulse Responses`, `Blocks`, `Rigs`, etc — create it yourself via
+(sibling to `Impulse Responses`, `Blocks`, `Rigs`, etc. — create it yourself via
 the File Manager/USB transfer view if it doesn't exist yet). Files are sorted
 alphabetically; a file's position in that order is its model number. Name them
 with a 3-digit index prefix so the order is explicit:
@@ -65,7 +86,7 @@ with a 3-digit index prefix so the order is explicit:
 - `001 - Second Model.nam`
 - `002 - Third Model.nam`
 
-**NAM pedals**: the **DRIVE** knob shows the model number `1..N` (N = number of
+**NAM pedals**: the **MODEL** knob shows the model number `1..N` (N = number of
 files) and the file name under it, so `000 - First Model.nam` is model 1. Every
 file is reachable, and the knob always lands on a real file.
 
@@ -111,28 +132,28 @@ pedalboard behaves as before.
 
 | Knob | Function | Display |
 |---|---|---|
-| **DRIVE** | selects the `.nam` model | model number `1..N` and the file name |
-| **LEVEL** | input volume | dB, same scale as the FX Loop RETURN |
-| **TONE** | output volume | dB, same scale as the FX Loop SEND |
-| **GAIN** (Low / High) | calibration | **High** = on, see "Gain staging" |
+| **MODEL** | selects the `.nam` model | model number `1..N` and the file name |
+| **INPUT** | input volume | dB, same scale as the FX Loop RETURN |
+| **OUTPUT** | output volume | dB, same scale as the FX Loop SEND |
+| **CALIB** (OFF / ON) | calibration | see "Gain staging" |
 
-The knob captions can't be changed (they are looked up by name in the
-firmware); they stay DRIVE / TONE / LEVEL. Known quirks: the pedal shows
-percentages for a few seconds after the device boots; the name under the number
-can lag behind a fast knob turn until you stop or reopen the page. See
-[docs/NAM_PEDAL_DISPLAY.md](docs/NAM_PEDAL_DISPLAY.md).
+Known quirks: the pedal shows percentages for a few seconds after the device
+boots, while it scans the model files; the file name under the number can lag
+behind a fast knob turn and catches up when you stop turning or reopen the
+page. See [docs/NAM_PEDAL_DISPLAY.md](docs/NAM_PEDAL_DISPLAY.md).
 
 ### Anxiety OD option (all models, opt-in)
 
-Tick **Make Anxiety OD run NAM** in the installer (on MX5 and Gigboard it's
-the default, since they have no NAM pedals yet) if you have pedalboards that
-use Anxiety OD as the NAM engine and want to keep them. On the device, add the **Anxiety OD** pedal.
+Tick **Make Anxiety OD run NAM** in the installer (on by default on the MX5
+and Gigboard) if you have pedalboards that use Anxiety OD as the NAM engine and
+want to keep them. On the device, add the **Anxiety OD** pedal.
 
 | Knob | Function |
 |---|---|
 | **DRIVE** | selects/scans `.nam` model files |
 | **TONE** | input trim |
 | **LEVEL** | output trim |
+| **Hi-Lo** | calibration (Hi = on), see "Gain staging" |
 
 This is a *hijack*: Anxiety OD loses its real overdrive function board-wide,
 on every instance. The two options can be installed together on the Pedalboard.
@@ -144,17 +165,71 @@ blocks on a board, so by default that's 2 NAM instances max, and Anxiety OD
 the same way, for up to 4 hijacked NAM instances total — at the cost of losing
 Anxiety OD V2's real sound board-wide too.
 
+## NAM quality: Auto / Lite / Full
+
+A2 models come in two sizes: a small one (Lite, cheap enough for several NAM
+pedals on one rig) and the full one (the same sound as on a computer, about two
+thirds of the board's CPU). Pick how each NAM pedal uses them with the
+**AUTO** / **LITE** / **FULL** buttons on its detail page (Pedalboard): one
+pedal can run Full while the others run Lite. The choice belongs to the pedal
+("NAM", "NAM 2", "NAM TWO", "NAM TWO 2"), not to a rig, and is kept across
+reboots.
+
+- **AUTO** (default): Full when it fits, Lite otherwise. A single NAM on a
+  mono signal gets Full; with two or more NAMs running, AUTO pedals get Lite. If a Full pedal
+  then gets a stereo signal or runs out of CPU, it drops to Lite; press AUTO
+  again to retry Full.
+- **LITE**: always the small size. No measuring and no reload when NAM pedals
+  come and go, for fast rig changes.
+- **FULL**: always the full size. Use **one NAM at a time**, with a mono signal
+  into it, and turn HeadRush's **Tails** setting **off** (with Tails on, a rig
+  change keeps the old rig running next to the new one: two NAMs at once,
+  which crackles).
+
+Switching reloads the model with a short fade. Other (non-A2) models sound the
+same in every mode. Confirmed on a Pedalboard.
+
+### NAM pedals on the MX5 and Gigboard (experimental)
+
+The installer offers the NAM and Reverb pedals on the MX5 and Gigboard too,
+marked **EXPERIMENTAL**: off by default, with a warning when you tick them.
+They are the Pedalboard's patches carried over to those firmwares: every
+address was found again in the MX5's and the Gigboard's own `Evil` and checked
+against it, and the build refuses if anything doesn't match, but **nobody has
+run them on a real MX5 or Gigboard yet**. The device may not boot: know the
+recovery steps in [docs/RECOVERY.md](docs/RECOVERY.md) first (the Gigboard has
+no footswitch recovery mode). Differences from the Pedalboard:
+
+- The knob captions under the screen stay **DRIVE / LEVEL / TONE** (they work
+  as MODEL / INPUT / OUTPUT): those two models have no editable tile source.
+- The detail page (model name, Auto / Lite / Full) is scaled to the smaller
+  (MX5) or larger (Gigboard) screen.
+- A third "NAM" can't be added while NAM and NAM 2 are in use (add NAM TWO).
+
+If you try it, please report what happens (boot, pedals in the Distortion list,
+sound, detail page) in an issue.
+
+## Reverb pedals (optional)
+
+Tick **Also add the Reverb pedals** in the installer (or pass
+`--reverb-pedal` to the CLI; needs the NAM pedals; on the MX5 and Gigboard see
+the experimental note above) to add **Reverb** and
+**Reverb 2** at the end of the Reverb list. They run Plate, Hall, Room and
+Spring algorithms, picked on the pedal's detail page. Confirmed on a
+Pedalboard. They can't be combined with the Anxiety OD option on the
+Pedalboard (the two don't fit together in the firmware's spare space). See
+[docs/REVERB_PEDAL.md](docs/REVERB_PEDAL.md).
+
 ## Footswitch page-turner (optional, Pedalboard only)
 
 Tick **Footswitch page-turner** in the installer (or pass `--page-pedal` to
 the CLI) and the Pedalboard also acts as a USB keyboard for the computer it's
-plugged into: the 5th footswitch from the left, **upper** row = **Page Down**,
-**lower** row = **Page Up**, for turning pages in a PDF. Leave those two
-switches unassigned in the HeadRush UI. The two switches light up (Page Down
-blue, Page Up white) and their small screens read **PAGE DOWN** / **PAGE UP**.
-The upper/lower numbering is a guess until confirmed on hardware, and there's a
-built-in calibration mode (and `--page-down-note` / `--page-up-note` to move the
-labels) — see [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md).
+plugged into: the 5th footswitch from the left, **upper** row = **Page Up**,
+**lower** row = **Page Down**, for turning pages in a PDF. Leave those two
+switches unassigned in the HeadRush UI. Both switches light up light blue and
+their small screens read **PAGE UP** / **PAGE DOWN**. To put the keys on other
+switches there's a calibration mode (and `--page-down-note` / `--page-up-note`
+to move the labels) — see [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md).
 
 ## Optional mods
 
@@ -164,7 +239,8 @@ own README has the details.
 
 | Mod | What it does | Models |
 |---|---|---|
-| NAM pedals | the **NAM** / **NAM TWO** pedals described above | Pedalboard |
+| NAM pedals | the **NAM** / **NAM TWO** pedals described above | Pedalboard (MX5, Gigboard: experimental) |
+| Reverb pedals | the **Reverb** / **Reverb 2** pedals described above; needs the NAM pedals, and not with Anxiety OD on the Pedalboard | Pedalboard (MX5, Gigboard: experimental) |
 | Anxiety OD runs NAM (up to 2 instances) | the Anxiety OD option described above | all |
 | Also Anxiety OD V2 (up to 4 instances) | see "2 instances vs up to 4" above | all |
 | Footswitch page-turner | see "Footswitch page-turner" above | Pedalboard |
@@ -181,26 +257,26 @@ them would take.
 | Device | Status |
 |---|---|
 | HeadRush **Pedalboard** | confirmed on real hardware |
-| HeadRush **MX5** | confirmed on real hardware |
-| HeadRush **Gigboard** | confirmed on real hardware |
+| HeadRush **MX5** | Anxiety OD design confirmed on real hardware; NAM / Reverb pedals experimental, untested |
+| HeadRush **Gigboard** | Anxiety OD design confirmed on real hardware; NAM / Reverb pedals experimental, untested |
 
 **Only flash the update file built for _your exact model and firmware_** —
 flashing another model's file will almost certainly brick the device.
 
 ## Gain staging
 
-**NAM pedals**: LEVEL (input) and TONE (output) are dB faders from -60 dB to
+**NAM pedals**: INPUT and OUTPUT are dB faders from -60 dB to
 +12 dB (0 dB = unity), the same scale and display as the FX Loop SEND/RETURN.
 The bottom of the travel is silence.
 
 **Calibration** (the Anxiety OD option's Hi-Lo switch does the same): set the
-NAM pedal's **GAIN** switch to **High** and the pedal calibrates itself from the
+NAM pedal's **CALIB** switch to **ON** and the pedal calibrates itself from the
 `.nam` file's metadata. The input is scaled so the model's own input level
 (dBu at 0 dBFS in its training capture) lines up with a 12.2 dBu interface, the
 rule the NAM plugin uses, and the output is normalized to the model's stated
 loudness (target -18 dB), so switching models keeps roughly the same volume.
 Both are capped at +-24 dB, files without that metadata are left untouched, and
-TONE / LEVEL still trim on top. **Low** (the default) leaves the signal as is.
+INPUT / OUTPUT still trim on top. **OFF** (the default) leaves the signal as is.
 
 **Anxiety OD option**: TONE and LEVEL are both **unity at 50%**, then diverge:
 
@@ -231,7 +307,11 @@ TONE / LEVEL still trim on top. **Low** (the default) leaves the signal as is.
   added to the firmware.
 - [docs/NAM_PEDAL_DISPLAY.md](docs/NAM_PEDAL_DISPLAY.md) — the dB faders and
   the model readout, and what doesn't work.
-- [docs/BUILDING.md](docs/BUILDING.md) — building `headrush-nam-gui` from
+- [docs/QML_PAGES.md](docs/QML_PAGES.md) — the parameter names and detail
+  pages of the NAM pedals.
+- [docs/REVERB_PEDAL.md](docs/REVERB_PEDAL.md) — the Reverb pedals.
+- [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md) — the footswitch page-turner.
+- [docs/BUILDING.md](docs/BUILDING.md) — building `nam-mod-gui` from
   source.
 - [mods/README.md](mods/README.md) — the optional MX5 mods, adding a new
   one, and porting them to other models.
@@ -250,6 +330,10 @@ By using this software, you accept full responsibility for any damage to
 your hardware, including but not limited to a failed flash, data loss, or
 voided manufacturer warranty. Proceed at your own risk.
 
+This project is not affiliated with, endorsed by, or supported by inMusic or
+HeadRush. Don't ask HeadRush support for help with a modded device: flash the
+stock updater back first (see [docs/RECOVERY.md](docs/RECOVERY.md)).
+
 ## License
 
 The patch scripts and glue code in this repo are licensed under the
@@ -261,6 +345,10 @@ license; full texts and per-release-artifact scope are in
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md), which ships inside
 every release download too.
 
-This project reverse-engineers and modifies HeadRush Pedalboard, MX5, and
-Gigboard firmware, which is not affiliated with or endorsed by inMusic/HeadRush.
-Use at your own risk; modifying your device's firmware may void its warranty.
+This project reverse-engineers HeadRush Pedalboard, MX5, and Gigboard firmware
+for interoperability, so that NAM models can run on those devices. The GPLv3
+covers only this project's own code, not HeadRush's firmware, which stays
+under HeadRush's terms and is never distributed here.
+
+Contributions are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) lists what can
+and can't go into the repository.

@@ -24,8 +24,12 @@ typedef void (*NamProgressFn)(const char* message, void* user_data);
  * the default is the NAM pedals alone (two new pedals, "NAM" and "NAM TWO",
  * two instances each, appear in the Distortion list and nothing stock is
  * touched); the Anxiety OD hijack is the older design, opt-in there and the
- * default on models without NAM pedals. Any combination is allowed, including
- * no NAM at all, as long as each mod supports the model.
+ * default on the MX5 / Gigboard, whose NAM pedals are EXPERIMENTAL (derived
+ * from the Pedalboard's, never run on those devices; core/spy_targets.c).
+ * The Reverb pedals (NAM_MOD_REVERB_PEDAL, docs/REVERB_PEDAL.md) are a third
+ * pair on top of the NAM pedals; on the Pedalboard they don't fit together
+ * with the Anxiety OD hijack. Any other combination is allowed, including no
+ * NAM at all, as long as each mod supports the model.
  *
  * The page-turner (NAM_MOD_PAGE_PEDAL) defaults to FS11 = Page Down and
  * FS5 = Page Up; set page_notes_set to use page_down_note / page_up_note

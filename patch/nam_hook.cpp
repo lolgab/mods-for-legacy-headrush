@@ -52,8 +52,10 @@
 #include <dlfcn.h>
 #include <cstdarg>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -65,8 +67,12 @@
 #include <memory>
 #include <mutex>
 #include <pthread.h>
+#include <signal.h>
 #include <string>
+#include <poll.h>
+#include <sys/inotify.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <type_traits>
 #include <map>
@@ -77,6 +83,8 @@
 #include "NAM/dsp.h"
 #include "NAM/get_dsp.h"
 #include "NAM/slimmable.h"
+
+#include "reverb_unit.h"
 
 namespace
 {
@@ -259,30 +267,12 @@ float trim_gain(float raw01)
   return std::pow(10.0f, db / 20.0f);
 }
 
-// dB-scale trim for the additive NAM pedals: -Inf .. +12 dB over the fader's 0..1 range, 0 dB at the default
-// (0.5). Below center the gain falls linearly in dB down to -60 dB at the very bottom (a plain dB taper), and the
-// last few percent fade on to true silence, so the bottom of the travel is "-Inf".
-float trim_gain_db(float raw01)
-{
-  if (raw01 <= 0.0f)
-    return 0.0f;
-  float db;
-  float extra = 1.0f;
-  if (raw01 < 0.5f)
-  {
-    db = -60.0f * (1.0f - raw01 * 2.0f);
-    if (raw01 < 0.03f)
-      extra = raw01 / 0.03f;
-  }
-  else
-  {
-    db = (raw01 - 0.5f) * 2.0f * trim_max_db();
-  }
-  return extra * std::pow(10.0f, db / 20.0f);
-}
-
 // The FX-Loop's SEND/RETURN faders (-60..+12 dB, "%.1f dB") -- what the additive NAM pedals' Level/Tone show once
-// their translators were cloned from those (nam_eng_init): dB is linear in the fader position.
+// their translators were cloned from those (nam_eng_init): dB is linear in the fader position. The NAM pedals' INPUT
+// and OUTPUT always use this curve, whatever the fader shows right now (percent for a few seconds after boot or while
+// a page is rebuilt). They used to follow the display: one unconverted fader anywhere flipped every NAM pedal to the
+// old percent curve, where the same fader position is up to 24 dB louder (0.5: -24 dB here, 0 dB there), on input
+// and output at once -- the "volume suddenly grows a lot" report.
 float trim_gain_fx(float raw01)
 {
   if (raw01 <= 0.004f)
@@ -340,8 +330,11 @@ struct CalibrationEntry
 {
   double ratio = -1.0;
   int epoch = -1;
+  bool no_full = false; // AUTO only: calibrated with the Full size excluded (see ModelState::auto_full_blocked)
+  bool top = false;     // the chosen ratio is the model's largest size
 };
-std::vector<CalibrationEntry> g_calibration_cache;
+std::vector<CalibrationEntry> g_calibration_cache; // Anxiety OD (the original rule)
+std::vector<CalibrationEntry> g_auto_cache;        // additive NAM pedals in AUTO (the AUTO rule)
 std::mutex g_calibration_cache_mutex;
 
 // Bumped every time state_for() claims a brand-new instance slot (i.e. a
@@ -372,7 +365,8 @@ void preload_models_in_background()
     {
       if (ec)
         break;
-      if (!entry.is_regular_file(ec))
+      std::error_code fec; // not `ec`: a failing stat on one entry must not end the whole scan at the check above
+      if (!entry.is_regular_file(fec))
         continue;
       // Skip macOS AppleDouble sidecar files ("._realname.nam") -- Finder
       // creates these alongside real files when copying to a FAT/exFAT USB
@@ -407,17 +401,25 @@ void preload_models_in_background()
         { auto discard = nam::get_dsp(j); }
         found.push_back(CachedModel{filename, std::move(j)});
       }
-      catch (...)
+      catch (const std::exception& e)
       {
         // Bad/corrupt file -- skip it, don't let one bad file block every
         // other model from loading.
+        std::fprintf(stderr, "[nam_models] skipped %s: %s\n", filename.c_str(), e.what());
+      }
+      catch (...)
+      {
+        std::fprintf(stderr, "[nam_models] skipped %s: unreadable\n", filename.c_str());
       }
     }
+    std::fprintf(stderr, "[nam_models] %zu usable .nam files in %s%s%s\n", found.size(), model_dir().c_str(),
+                 ec ? " (scan error: " : "", ec ? ec.message().c_str() : "");
 
     std::sort(found.begin(), found.end(),
               [](const CachedModel& a, const CachedModel& b) { return a.display_name < b.display_name; });
 
     g_calibration_cache.assign(found.size(), CalibrationEntry{});
+    g_auto_cache.assign(found.size(), CalibrationEntry{});
     g_cached_models = std::move(found);
     g_models_ready.store(true, std::memory_order_release);
   });
@@ -497,6 +499,26 @@ struct ModelState
   // could be mid-call on the very same object.
   std::unique_ptr<nam::DSP> pending_dsp[kMaxChannels];
   int pending_index = -1; // set before pending_ready; read only after
+  // NAM quality (A2 models, see namespace quality): the loader records the mode it built under and whether it built
+  // the largest size in pending_mode / pending_full (set before pending_ready, like pending_index); active_mode /
+  // active_full are what is playing (audio thread only). A mode other than the selected one sends the pedal through
+  // the same duck-out/reload/duck-in cycle as a model change.
+  std::atomic<int> want_mode{0}; // the selected mode (quality::Mode), resolved by the audio thread every block
+  int seen_slot = -1;             // quality name slot this engine had last block (audio thread only)
+  int pending_mode = -1;
+  bool pending_full = false;
+  int active_mode = -1;
+  bool active_full = false;
+  // AUTO's watchdog (audio thread): set when an AUTO pedal running the Full size sees a stereo input or overruns; the
+  // reload that follows calibrates without the Full size. The loader reads it, hence atomic. Cleared when AUTO is
+  // picked again on the page (quality::g_gen), which also retries Full (auto_retry).
+  std::atomic<bool> auto_full_blocked{false};
+  bool auto_retry = false;
+  int seen_mode_gen = 0;
+  int stereo_blocks = 0;
+  int overruns = 0;
+  int64_t overrun_window_ms = 0;
+  uint32_t last_block_us = 0; // this pedal's own process() time in the previous block (audio thread only)
   std::atomic<bool> pending_ready{false};
   // 0=steady, 1=fading out the old model, 2=fading in the new one. Atomic
   // because switch_model_in_background (background thread) reads it to
@@ -532,9 +554,6 @@ struct ModelState
   // Diagnostics (additive NAM pedals): process() calls seen, for the journal heartbeat in nam_process_common.
   std::atomic<uint32_t> calls{0};
 
-  // Additive NAM pedals: set once the Level/Tone faders' translators were cloned from the FX-Loop's dB ones, so the
-  // trim gain must follow that display's curve (see trim_gain_fx).
-  std::atomic<bool> disp_db{false};
   std::atomic<bool> is_eng{false};
 };
 
@@ -711,8 +730,281 @@ int count_claimed_instances()
   return n;
 }
 
-double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable)
+// NAM quality: which size A2 models run at, picked per pedal on its detail page (ui/nam_ui.qml) and kept across reboots
+// in <model dir>/nam_quality.txt ("NAM 2=full" lines). A pedal is known by its name ("NAM", "NAM 2", "NAM TWO",
+// "NAM TWO 2"), which nam_eng_record reads when the pedal's engine is created; an engine with no recorded name uses AUTO. A2 models measured here have two sizes,
+// ~104 us (Lite) and ~680 us (Full) per channel, against a 1000 us block shared by the whole board.
+//   AUTO  (default) calibrate: the largest size that fits 75% of 1000 us / active NAMs on a mono input, so one NAM gets
+//         Full and two get Lite; a new NAM joining recalibrates. While on Full a watchdog drops to Lite on a stereo
+//         input or repeated overruns (ModelState::auto_full_blocked) until AUTO is picked again.
+//   LITE  always the smallest size: no calibration, no reload when NAMs are added (fast rig changes).
+//   FULL  always the largest: one NAM at a time, mono input, HeadRush "Tails" off (with Tails on, a rig change keeps
+//         the old rig running next to the new one: two NAMs for a while).
+// Anxiety OD (the hijack) keeps the original rule (kLegacy): 2 channels, 50% margin, in practice always Lite.
+//
+// The page can't call into the hook (this Qt has no XMLHttpRequest) and can't write files: its buttons load a tiny
+// image, /tmp/nam_mode/<pedal name, spaces as _>-<auto|lite|full>.png?<time>, and a thread here sees the open through
+// inotify. An Image is used rather than a QML file because the QML disk cache may skip reading a file it already
+// compiled. The hook writes every pedal's mode back as /tmp/nam_mode_state.qml for the page to show.
+namespace quality
 {
+enum Mode : int
+{
+  kAuto = 0,
+  kLite = 1,
+  kFull = 2,
+  kLegacy = 3, // Anxiety OD
+};
+const char* const kNames[3] = {"auto", "lite", "full"};
+const char* const kDir = "/tmp/nam_mode";
+const char* const kState = "/tmp/nam_mode_state.qml";
+
+// One slot per pedal name. Slots are claimed by nam_eng_record (Evil's thread that creates pedals, never the audio
+// thread) and never released; the audio thread only reads `mode` / `gen`.
+constexpr int kMaxNames = 8;
+struct NameSlot
+{
+  char name[32] = {};
+  std::atomic<bool> used{false};
+  bool files = false;           // the trigger images exist (watcher thread only)
+  std::atomic<int> mode{kAuto};
+  std::atomic<int> gen{0};      // bumped on every selection, also of the mode already selected (AUTO again = retry Full)
+};
+NameSlot g_names[kMaxNames];
+std::mutex g_names_mutex;
+std::map<std::string, int> g_saved; // modes read from the file, for pedals not seen yet (under g_names_mutex)
+bool g_saved_loaded = false;
+std::atomic<bool> g_dirty{false}; // a slot was claimed: the watcher creates its images and rewrites the state file
+
+std::filesystem::path conf_path()
+{
+  return model_dir() / "nam_quality.txt";
+}
+
+std::string file_key(const char* name)
+{
+  std::string k(name);
+  std::replace(k.begin(), k.end(), ' ', '_');
+  return k;
+}
+
+void write_file_atomically(const std::string& path, const std::string& text)
+{
+  const std::string tmp = path + ".tmp";
+  if (FILE* f = std::fopen(tmp.c_str(), "w"))
+  {
+    const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    if (std::fclose(f) == 0 && ok && std::rename(tmp.c_str(), path.c_str()) == 0)
+      return;
+  }
+  std::fprintf(stderr, "[nam_mode] could not write %s: %s\n", path.c_str(), std::strerror(errno));
+}
+
+// caller holds g_names_mutex
+void load_saved_locked()
+{
+  if (g_saved_loaded)
+    return;
+  g_saved_loaded = true;
+  std::ifstream f(conf_path());
+  std::string line;
+  while (std::getline(f, line))
+  {
+    const auto eq = line.rfind('=');
+    if (eq == std::string::npos)
+      continue;
+    const std::string word = line.substr(eq + 1);
+    for (int m = 0; m < 3; ++m)
+      if (word == kNames[m])
+        g_saved[line.substr(0, eq)] = m;
+  }
+}
+
+// The slot of a pedal name (claimed on first sight, with its saved mode); -1 if the name is empty or every slot is taken.
+int slot_for_name(const char* name)
+{
+  if (!name[0])
+    return -1;
+  std::lock_guard<std::mutex> lock(g_names_mutex);
+  for (int i = 0; i < kMaxNames; ++i)
+    if (g_names[i].used.load(std::memory_order_acquire) && std::strcmp(g_names[i].name, name) == 0)
+      return i;
+  load_saved_locked();
+  for (int i = 0; i < kMaxNames; ++i)
+    if (!g_names[i].used.load(std::memory_order_acquire))
+    {
+      std::snprintf(g_names[i].name, sizeof(g_names[i].name), "%s", name);
+      const auto it = g_saved.find(name);
+      g_names[i].mode.store(it != g_saved.end() ? it->second : static_cast<int>(kAuto), std::memory_order_release);
+      g_names[i].used.store(true, std::memory_order_release);
+      g_dirty.store(true, std::memory_order_release);
+      return i;
+    }
+  return -1;
+}
+
+void write_state()
+{
+  std::string qml = "import QtQuick 2.2\nQtObject { property var modes: ({";
+  {
+    std::lock_guard<std::mutex> lock(g_names_mutex);
+    bool first = true;
+    for (const auto& n : g_names)
+      if (n.used.load(std::memory_order_acquire))
+      {
+        qml += std::string(first ? "" : ", ") + "\"" + n.name + "\": " + std::to_string(n.mode.load());
+        first = false;
+      }
+  }
+  qml += "}) }\n";
+  write_file_atomically(kState, qml);
+}
+
+void save()
+{
+  std::string text;
+  {
+    std::lock_guard<std::mutex> lock(g_names_mutex);
+    load_saved_locked();
+    for (const auto& n : g_names)
+      if (n.used.load(std::memory_order_acquire))
+        g_saved[n.name] = n.mode.load();
+    for (const auto& kv : g_saved) // pedals not on this board keep their mode too
+      text += kv.first + "=" + kNames[kv.second] + "\n";
+  }
+  write_file_atomically(conf_path().string(), text);
+}
+
+void select(int slot, int m)
+{
+  g_names[slot].mode.store(m, std::memory_order_release);
+  g_names[slot].gen.fetch_add(1, std::memory_order_acq_rel);
+  write_state();
+  save();
+  std::fprintf(stderr, "[nam_mode] %s: %s\n", g_names[slot].name, kNames[m]);
+}
+
+// "<key>-<mode>.png" -> select
+void on_open(const char* file)
+{
+  const std::string f(file);
+  const auto dash = f.rfind('-');
+  if (dash == std::string::npos || f.size() < 4 || f.compare(f.size() - 4, 4, ".png") != 0)
+    return;
+  const std::string key = f.substr(0, dash), word = f.substr(dash + 1, f.size() - 4 - dash - 1);
+  for (int m = 0; m < 3; ++m)
+    if (word == kNames[m])
+      for (int i = 0; i < kMaxNames; ++i)
+        if (g_names[i].used.load(std::memory_order_acquire) && file_key(g_names[i].name) == key)
+          select(i, m);
+}
+
+// creates the trigger images of newly claimed slots
+void publish_new_slots()
+{
+  // 1x1 transparent PNG: what the page's Image loads
+  static const unsigned char kPng[] = {
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00,
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00,
+    0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00, 0x00, 0x05, 0x00,
+    0x01, 0x7a, 0x5e, 0xab, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
+  if (!g_dirty.exchange(false, std::memory_order_acq_rel))
+    return;
+  for (auto& n : g_names)
+    if (n.used.load(std::memory_order_acquire) && !n.files)
+    {
+      // the .tmp + rename write opens "<file>.tmp", which on_open ignores, never "<file>" itself
+      for (const char* m : kNames)
+        write_file_atomically(std::string(kDir) + "/" + file_key(n.name) + "-" + m + ".png",
+                              std::string(reinterpret_cast<const char*>(kPng), sizeof(kPng)));
+      n.files = true;
+      std::fprintf(stderr, "[nam_mode] pedal \"%s\": %s\n", n.name, kNames[n.mode.load()]);
+    }
+  write_state();
+}
+
+void watch()
+{
+  ::mkdir(kDir, 0755);
+  const int fd = inotify_init1(IN_CLOEXEC);
+  if (fd < 0 || inotify_add_watch(fd, kDir, IN_OPEN) < 0)
+  {
+    std::fprintf(stderr, "[nam_mode] inotify on %s failed: %s\n", kDir, std::strerror(errno));
+    return;
+  }
+  alignas(inotify_event) char buf[4096];
+  for (;;)
+  {
+    publish_new_slots();
+    pollfd p{fd, POLLIN, 0};
+    const int r = poll(&p, 1, 500);
+    if (r < 0 && errno != EINTR)
+    {
+      std::fprintf(stderr, "[nam_mode] poll failed: %s\n", std::strerror(errno));
+      return;
+    }
+    if (r <= 0)
+      continue;
+    const ssize_t n = read(fd, buf, sizeof(buf));
+    if (n <= 0)
+      continue;
+    for (char* q = buf; q < buf + n;)
+    {
+      const auto* ev = reinterpret_cast<const inotify_event*>(q);
+      if (ev->len > 0)
+        on_open(ev->name);
+      q += sizeof(inotify_event) + ev->len;
+    }
+  }
+}
+
+// once, from nam_eng_init (the additive NAM pedals' display init)
+void start()
+{
+  static std::atomic<bool> started{false};
+  bool expected = false;
+  if (!started.compare_exchange_strong(expected, true))
+    return;
+  g_dirty.store(true, std::memory_order_release); // pedals recorded before this still need their images
+  std::fprintf(stderr, "[nam_mode] start (%s)\n", conf_path().c_str());
+  spawn_detached([]() { watch(); });
+}
+} // namespace quality
+
+// the ARM test (patch/test_nam_quality.c) starts it directly; on the device nam_eng_init does
+extern "C" void nam_quality_start()
+{
+  quality::start();
+}
+
+// AUTO: share of the per-NAM budget the model may take. NAM_AUTO_MARGIN overrides it (tests under emulation, where
+// everything is several times slower, use a large one to get Full).
+double auto_safety_margin()
+{
+  if (const char* env = std::getenv("NAM_AUTO_MARGIN"))
+    return std::strtod(env, nullptr);
+  return 0.75;
+}
+// AUTO watchdog: a block of this pedal alone over this counts as an overrun (NAM_AUTO_OVERRUN_US overrides it, tests)
+uint32_t auto_overrun_us()
+{
+  static const uint32_t us = [] {
+    const char* env = std::getenv("NAM_AUTO_OVERRUN_US");
+    return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 850u;
+  }();
+  return us;
+}
+constexpr int kAutoOverruns = 3;           // ... this many within 2 s drop Full
+constexpr int kAutoStereoBlocks = 50;      // ... as do this many blocks in a row (~50 ms) of stereo input
+
+// Picks the largest size whose benchmark fits. `channels` is how many model runs per block are assumed (Anxiety OD's
+// original rule: 2, the stereo worst case; AUTO: 1, the dual-mono case, with the watchdog covering stereo), `margin`
+// the share of the per-instance budget allowed, `allow_top` false skips the largest size. *top tells whether the
+// largest size was picked.
+double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable, int channels, double margin,
+                                   bool allow_top, bool* top)
+{
+  *top = false;
   const int concurrent_instances = std::max(1, count_claimed_instances());
   const double budget_us = static_cast<double>(kCalibrationBlockSize) / kSampleRate * 1e6 / concurrent_instances;
   const auto breakpoints = slimmable.GetSlimmableSizeBreakpoints();
@@ -734,6 +1026,8 @@ double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable
   // "Full"). Measured on hardware per channel: ~680 us for the large size, ~104 us for the small one.
   for (size_t tier = num_tiers; tier-- > 0;) // highest quality first
   {
+    if (!allow_top && num_tiers > 1 && tier == num_tiers - 1)
+      continue;
     const double ratio = (static_cast<double>(tier) + 0.5) / static_cast<double>(num_tiers);
     slimmable.SetSlimmableSize(ratio);
     dsp.Reset(kSampleRate, kCalibrationBlockSize); // re-warm at this tier before timing
@@ -747,12 +1041,14 @@ double calibrate_slimmable_quality(nam::DSP& dsp, nam::SlimmableModel& slimmable
                            / static_cast<double>(kCalibrationIters);
 
     // the benchmark runs ONE channel's model; instances normally run one (dual-mono input, see nam_process_common) but
-    // two when the input is true stereo, so the conservative cost is avg_us * kMaxChannels
+    // two when the input is true stereo
     std::fprintf(stderr, "[nam_cal] instances=%d budget=%.0fus tier=%zu/%zu ratio=%.2f avg=%.0fus x%d channels need<%.0fus\n",
-                 concurrent_instances, budget_us, tier, num_tiers, ratio, avg_us, static_cast<int>(kMaxChannels),
-                 budget_us * kCalibrationSafetyMargin);
-    if (avg_us * kMaxChannels < budget_us * kCalibrationSafetyMargin)
+                 concurrent_instances, budget_us, tier, num_tiers, ratio, avg_us, channels, budget_us * margin);
+    if (avg_us * channels < budget_us * margin)
+    {
+      *top = num_tiers > 1 && tier == num_tiers - 1;
       return ratio;
+    }
   }
   std::fprintf(stderr, "[nam_cal] nothing fit the budget: falling back to the minimum tier\n");
   return 0.0; // nothing fit safely -- fall back to minimum/Lite
@@ -817,6 +1113,8 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
       } reset{s.switching};
 
       const int idx = knob_value_to_index(raw, static_cast<int>(g_cached_models.size()));
+      const int mode = s.want_mode.load(std::memory_order_acquire);
+      const bool no_full = s.auto_full_blocked.load(std::memory_order_acquire);
       if (idx == -2 || (idx == s.active_index.load(std::memory_order_acquire) && !force_reload_same_model))
         return; // no files found at all, or knob moved but landed back on the same state
                 // (unless a forced recalibration deliberately wants this same model rebuilt)
@@ -830,6 +1128,8 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
         for (int i = 0; i < kMaxChannels; ++i)
           s.pending_dsp[i].reset();
         s.pending_index = idx;
+        s.pending_mode = mode;
+        s.pending_full = false;
         s.pending_ready.store(true, std::memory_order_release);
         return;
       }
@@ -837,6 +1137,7 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
 
       std::unique_ptr<nam::DSP> loaded[kMaxChannels];
       double chosen_ratio = 1.0;
+      bool built_full = false;
       constexpr int32_t kPrewarmSamples = 16384;
       constexpr int32_t kPrewarmBlockSize = 128;
       for (int i = 0; i < kMaxChannels; ++i)
@@ -869,22 +1170,37 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
           // internal sub-model reconstruction per tier tested) on every
           // single switch was pure avoidable churn once a model has already
           // been calibrated once.
-          if (i == 0)
+          if (i == 0 && (mode == quality::kLite || mode == quality::kFull))
           {
+            // LITE / FULL: a fixed size, no calibration (see namespace quality)
+            chosen_ratio = mode == quality::kFull ? 1.0 : 0.0;
+            slimmable->SetSlimmableSize(chosen_ratio);
+            built_full = mode == quality::kFull && !slimmable->GetSlimmableSizeBreakpoints().empty();
+            std::fprintf(stderr, "[nam_load] %p model %d mode=%s tier=%.2f instances=%d\n", s.owner_this.load(), idx,
+                         quality::kNames[mode], chosen_ratio, count_claimed_instances());
+          }
+          else if (i == 0)
+          {
+            const bool is_auto = mode == quality::kAuto;
             std::lock_guard<std::mutex> lock(g_calibration_cache_mutex);
-            auto& entry = g_calibration_cache[static_cast<size_t>(idx)];
+            auto& entry = (is_auto ? g_auto_cache : g_calibration_cache)[static_cast<size_t>(idx)];
             const int live_epoch = g_topology_epoch.load(std::memory_order_acquire);
             // Stale-by-epoch counts as a miss too, not just never-calibrated
             // -- see CalibrationEntry's own comment.
-            if (entry.ratio < 0.0 || entry.epoch != live_epoch)
+            if (entry.ratio < 0.0 || entry.epoch != live_epoch || entry.no_full != (is_auto && no_full))
             {
-              entry.ratio = calibrate_slimmable_quality(*d, *slimmable);
+              entry.ratio = is_auto ? calibrate_slimmable_quality(*d, *slimmable, 1, auto_safety_margin(), !no_full, &entry.top)
+                                    : calibrate_slimmable_quality(*d, *slimmable, kMaxChannels, kCalibrationSafetyMargin,
+                                                                  true, &entry.top);
               entry.epoch = live_epoch;
+              entry.no_full = is_auto && no_full;
             }
             else
               slimmable->SetSlimmableSize(entry.ratio);
             chosen_ratio = entry.ratio;
-            std::fprintf(stderr, "[nam_load] model %d tier=%.2f instances=%d epoch=%d\n", idx, chosen_ratio,
+            built_full = entry.top;
+            std::fprintf(stderr, "[nam_load] %p model %d mode=%s tier=%.2f%s instances=%d epoch=%d\n", s.owner_this.load(), idx,
+                         is_auto ? "auto" : "legacy", chosen_ratio, is_auto && no_full ? " (full blocked)" : "",
                          count_claimed_instances(), live_epoch);
           }
           else
@@ -964,6 +1280,8 @@ void switch_model_in_background(ModelState& s, float raw, bool force_reload_same
       for (int i = 0; i < kMaxChannels; ++i)
         s.pending_dsp[i] = std::move(loaded[i]);
       s.pending_index = idx;
+      s.pending_mode = mode;
+      s.pending_full = built_full;
       s.pending_ready.store(true, std::memory_order_release);
     }
     catch (...)
@@ -1159,10 +1477,26 @@ extern "C" void nam_process_gonk(void* this_, uint32_t /*param2*/, float** input
 // sit at +0x540 (Level = input), +0x554 (Drive = model) and +0x568 (Tone = output) -- the editor lists Level before
 // Tone, so the input comes first; the engine floats themselves are confirmed on hardware:
 // the engine creates them in Level, Drive, Tone order, like Anxiety OD's.
+//
+// The same engine class also backs the "Reverb" / "Reverb 2" pedals (a Dattorro plate reverb, see
+// dattorro_reverb.h): the engine stub records {engine, &name QString} for every instance, and an engine whose pedal
+// name starts with "Reverb" is routed to reverb_process() instead of NAM. Knob meaning there: Drive = decay,
+// Level = dry/wet mix, Tone = damping (bright at 1). The Gain Low/High switch (byte 0x57c) picks the algorithm,
+// see default_reverb_algo(); the dev control channel (namespace devctl) can override everything.
+static bool eng_is_reverb(void* eng);
+static int eng_name_slot(void* eng);
+static void reverb_process(void* eng, float** input, uint32_t numChannels, float** output, int32_t numFrames);
+
 extern "C" void nam_process_eng(void* this_, uint32_t /*param2*/, float** input, uint32_t numChannels,
                                  float** output, int32_t numFrames, uint32_t* /*flags*/, void* /*ctx*/)
 {
   static const KnobLayout kEng = {0x554, 0x540, 0x568, 0x26b, 0x57c, true}; // model, input, output
+  if (eng_is_reverb(this_))
+  {
+    flush_denormals_to_zero();
+    reverb_process(this_, input, numChannels, output, numFrames);
+    return;
+  }
   nam_process_common(this_, input, numChannels, output, numFrames, kEng);
 }
 
@@ -1185,6 +1519,7 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
     {
       const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
       const uint32_t us = static_cast<uint32_t>(ns / 1000);
+      st.last_block_us = us;
       st.cpu_sum_ns.fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
       if (us > st.cpu_max_us.load(std::memory_order_relaxed))
         st.cpu_max_us.store(us, std::memory_order_relaxed);
@@ -1223,6 +1558,12 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
   const float tone_raw = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(this_) + kl.input);   // input trim
   const float level_raw = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(this_) + kl.output); // output trim
   const uint8_t bypass_byte = *(reinterpret_cast<uint8_t*>(this_) + kl.bypass);
+  // NAM quality of this pedal (namespace quality): before any load starts, the loader reads it from want_mode
+  const int name_slot = kl.db_trim ? eng_name_slot(this_) : -1;
+  s.want_mode.store(!kl.db_trim     ? static_cast<int>(quality::kLegacy)
+                    : name_slot >= 0 ? quality::g_names[name_slot].mode.load(std::memory_order_acquire)
+                                     : static_cast<int>(quality::kAuto),
+                    std::memory_order_release);
 
   // Bypass is checked further down now, right before the first place it
   // actually needs to change behavior (the produced audio) -- NOT here.
@@ -1311,9 +1652,35 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
     // switch_model_in_background's epoch-tagged cache check (see
     // CalibrationEntry) then recalculates its tier against the new,
     // smaller budget instead of reusing the stale cached one.
-    if (s.fade_state.load(std::memory_order_relaxed) == 0 && s.active_index.load(std::memory_order_acquire) >= 0
-        && s.calibrated_epoch.load(std::memory_order_acquire) != g_topology_epoch.load(std::memory_order_acquire))
+    //
+    // The same cycle applies the NAM quality mode (namespace quality): a new mode picked on the page, AUTO's watchdog
+    // dropping Full, or AUTO picked again (retry Full). Only calibrated modes (AUTO, Anxiety OD) depend on the budget,
+    // so only they reload when an instance joins.
+    const int want_mode = s.want_mode.load(std::memory_order_relaxed);
+    const int gen = name_slot >= 0 ? quality::g_names[name_slot].gen.load(std::memory_order_acquire) : 0;
+    if (name_slot != s.seen_slot) // first block, or the engine now belongs to another pedal: nothing to retry
     {
+      s.seen_slot = name_slot;
+      s.seen_mode_gen = gen;
+    }
+    if (gen != s.seen_mode_gen)
+    {
+      s.seen_mode_gen = gen;
+      if (want_mode == quality::kAuto)
+      {
+        s.auto_full_blocked.store(false, std::memory_order_release);
+        s.auto_retry = s.active_mode == quality::kAuto && !s.active_full;
+      }
+    }
+    const bool mode_changed = s.active_mode != want_mode;
+    const bool auto_downgrade = s.active_mode == quality::kAuto && s.active_full
+                                && s.auto_full_blocked.load(std::memory_order_acquire);
+    const bool epoch_stale = (s.active_mode == quality::kAuto || s.active_mode == quality::kLegacy)
+                             && s.calibrated_epoch.load(std::memory_order_acquire) != g_topology_epoch.load(std::memory_order_acquire);
+    if (s.fade_state.load(std::memory_order_relaxed) == 0 && s.active_index.load(std::memory_order_acquire) >= 0
+        && (epoch_stale || mode_changed || auto_downgrade || s.auto_retry))
+    {
+      s.auto_retry = false;
       s.force_recalibrate = true;
       s.fade_state.store(1, std::memory_order_relaxed);
       s.fade_progress = 0;
@@ -1374,6 +1741,8 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
       for (int i = 0; i < kMaxChannels; ++i)
         s.dsp[i] = std::move(s.pending_dsp[i]);
       s.active_index.store(s.pending_index, std::memory_order_release);
+      s.active_full = s.pending_full;
+      s.active_mode = s.pending_mode;
       s.pending_ready.store(false, std::memory_order_release);
       s.ready.store(true, std::memory_order_release);
       ready = true;
@@ -1388,6 +1757,8 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
       for (int i = 0; i < kMaxChannels; ++i)
         s.dsp[i] = std::move(s.pending_dsp[i]);
       s.active_index.store(s.pending_index, std::memory_order_release);
+      s.active_full = s.pending_full;
+      s.active_mode = s.pending_mode;
       s.pending_ready.store(false, std::memory_order_release);
       s.fade_progress = 0;
       s.fade_state.store(s.pending_index < 0 ? 0 : 2, std::memory_order_relaxed);
@@ -1410,9 +1781,9 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
 
   // Tone/Level are [0,1] with 0.5=center/unity, 0.0=silence -- trim_gain()
   // takes that range directly.
-  const bool fx_curve = kl.db_trim && s.disp_db.load(std::memory_order_relaxed);
-  float in_gain = fx_curve ? trim_gain_fx(tone_raw) : kl.db_trim ? trim_gain_db(tone_raw) : trim_gain(tone_raw);
-  float out_gain = fx_curve ? trim_gain_fx(level_raw) : kl.db_trim ? trim_gain_db(level_raw) : trim_gain(level_raw);
+  // NAM pedals: the dB fader curve, always (see trim_gain_fx); Anxiety OD: its knob curve
+  float in_gain = kl.db_trim ? trim_gain_fx(tone_raw) : trim_gain(tone_raw);
+  float out_gain = kl.db_trim ? trim_gain_fx(level_raw) : trim_gain(level_raw);
   // dsp[0] is non-null whenever a real model is active (see silent_active below); the model is only swapped while
   // faded out / muted, so reading its metadata here is safe.
   const bool cal_on = hilo_is_on(this_, kl.hilo);
@@ -1447,6 +1818,31 @@ static void nam_process_common(void* this_, float** input, uint32_t numChannels,
   const bool dual_mono = numChannels == 2 && input[0] && input[1] && output[0] && output[1] && !silent_active
                          && std::memcmp(output[0], output[1], static_cast<size_t>(numFrames) * sizeof(float)) == 0;
   const uint32_t dsp_channels = dual_mono ? 1u : numChannels;
+  // AUTO's watchdog (namespace quality): Full was picked for a mono input with some headroom; a stereo input (two model
+  // runs) or repeated overruns of this pedal's own block time drop it to the next size (the reload happens in the
+  // steady-state check above, next block).
+  if (s.active_mode == quality::kAuto && s.active_full && fade_state == 0 && !silent_active
+      && !s.auto_full_blocked.load(std::memory_order_relaxed))
+  {
+    if (!dual_mono && numChannels == 2)
+    {
+      if (++s.stereo_blocks >= kAutoStereoBlocks)
+        s.auto_full_blocked.store(true, std::memory_order_release);
+    }
+    else
+      s.stereo_blocks = 0;
+    if (s.last_block_us > auto_overrun_us())
+    {
+      const int64_t now = now_ms();
+      if (now - s.overrun_window_ms > 2000)
+      {
+        s.overrun_window_ms = now;
+        s.overruns = 0;
+      }
+      if (++s.overruns >= kAutoOverruns)
+        s.auto_full_blocked.store(true, std::memory_order_release);
+    }
+  }
   if (fade_state == 0)
   {
     for (uint32_t ch = 0; ch < dsp_channels; ++ch)
@@ -1878,7 +2274,8 @@ std::vector<std::string> drive_names()
       if (ec)
         break;
       const std::string fn = entry.path().filename().string();
-      if (fn.rfind("._", 0) == 0 || !entry.is_regular_file(ec))
+      std::error_code fec;
+      if (fn.rfind("._", 0) == 0 || !entry.is_regular_file(fec))
         continue;
       std::string ext = entry.path().extension().string();
       std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -1889,6 +2286,47 @@ std::vector<std::string> drive_names()
     at = now;
   }
   return quick;
+}
+
+// The text shown for a model file: no ".nam", no "NNN - " ordering prefix
+std::string model_label(std::string name)
+{
+  if (name.size() > 4 && lower(name.substr(name.size() - 4)) == ".nam")
+    name.resize(name.size() - 4);
+  if (name.size() > 6 && std::isdigit(static_cast<unsigned char>(name[0])) && name.compare(3, 3, " - ") == 0)
+    name.erase(0, 6);
+  return name;
+}
+
+// The detail pages (ui/nam_ui.qml, loaded from /usr/Evil/Resources) show the model name next to the number from the
+// very same Drive value, so the name cannot lag. Qt's QML here has no XMLHttpRequest: the list is a tiny QML file the
+// page loads with a Loader. Rewritten (atomically) only when the list changes.
+void publish_model_names(const std::vector<std::string>& names)
+{
+  static std::string last;
+  std::string qml = "import QtQuick 2.2\nQtObject { property var names: [";
+  for (const auto& n : names)
+  {
+    qml += '"';
+    for (char c : model_label(n))
+    {
+      if (c == '"' || c == '\\')
+        qml += '\\';
+      if (static_cast<unsigned char>(c) >= 0x20)
+        qml += c;
+    }
+    qml += "\",";
+  }
+  qml += "] }\n";
+  if (qml == last)
+    return;
+  const char* const tmp = "/tmp/nam_models.qml.tmp";
+  if (FILE* f = std::fopen(tmp, "w"))
+  {
+    const bool ok = std::fwrite(qml.data(), 1, qml.size(), f) == qml.size();
+    if (std::fclose(f) == 0 && ok && std::rename(tmp, "/tmp/nam_models.qml") == 0)
+      last = qml;
+  }
 }
 
 // Drive as a plain model number 1..n: the editor's own number formatter needs no per-value text, so nothing can lag
@@ -1905,11 +2343,7 @@ bool set_desc_index(uintptr_t desc, const std::vector<std::string>& names)
   if (n > 0 && val >= 0.0f && val <= 1.0f)
   {
     const int z = std::clamp(static_cast<int>(std::lround(val * static_cast<float>(n - 1))), 0, n - 1);
-    std::string name = names[static_cast<size_t>(z)];
-    if (name.size() > 4 && lower(name.substr(name.size() - 4)) == ".nam")
-      name.resize(name.size() - 4);
-    if (name.size() > 6 && std::isdigit(static_cast<unsigned char>(name[0])) && name.compare(3, 3, " - ") == 0)
-      name.erase(0, 6);
+    const std::string name = model_label(names[static_cast<size_t>(z)]);
     f += ' ';
     for (char c : name)
     {
@@ -2175,12 +2609,13 @@ void display_watcher()
   // saved FX-Loop Return / Send descs: the dB template the Level / Tone descs are converted from, at any moment
   uint8_t ret_bytes[kDescSize] = {}, send_bytes[kDescSize] = {};
   bool have_donors = false;
-  int percent_passes = 0; // consecutive passes with an unconverted Level / Tone desc (debounces the curve switch)
+  int percent_passes = 0; // consecutive passes with an unconverted Level / Tone desc (debounces the log line)
   for (int loops = 0;; ++loops)
   {
     report_engine_stats();
     last_val.clear(); // re-verify every desc once per pass (a recreated desc may sit at the same address)
     const auto fast_names = drive_names();
+    publish_model_names(fast_names);
     for (int sub = 0; sub < (loops < 1000 ? 30 : 250); ++sub)
     {
       usleep(2 * 1000);
@@ -2277,6 +2712,8 @@ void display_watcher()
         {
           char nm[64] = {};
           safe_read(t.name, nm, 63);
+          if (std::strncmp(nm, "Reverb", 6) == 0)
+            continue; // reverb knobs keep the stock percent display
           for (const auto& pr : {std::pair<const char*, Binding::Kind>{"Level", Binding::Level},
                                  {"Tone", Binding::Tone}, {"Drive", Binding::Drive}})
           {
@@ -2349,10 +2786,11 @@ void display_watcher()
       }
     }
 
-    // dB gain curve once every NAM Level / Tone translator reads in dB (instances are not told apart any more:
-    // the props are patched wherever they are found, the engines only need the flag)
+    // Whether every NAM Level / Tone fader reads in dB, for the journal only: the gain no longer depends on it (see
+    // trim_gain_fx)
     bool any_level = false, any_tone = false, all_db = true;
     const auto names_now = drive_names();
+    publish_model_names(names_now);
     const int n_models = static_cast<int>(names_now.size());
     for (const auto& b : bound)
     {
@@ -2374,25 +2812,15 @@ void display_watcher()
       all_db = all_db && db;
       (b.kind == Binding::Level ? any_level : any_tone) = true;
     }
-    // only fall back to the old curve if an unconverted desc persists (the 2 ms loop converts a new one at once)
+    // log only a state that lasts (the 2 ms loop converts a new desc at once)
     percent_passes = (any_level && any_tone && !all_db) ? percent_passes + 1 : 0;
-    static bool curve_db = false;
-    if (any_level && any_tone && all_db)
-      curve_db = true;
-    else if (percent_passes >= 8)
-      curve_db = false;
-    const bool use_db = curve_db;
-    static int last_use_db = -1;
-    if (static_cast<int>(use_db) != last_use_db)
+    static int last_all_db = -1;
+    const int all_db_now = any_level && any_tone && all_db ? 1 : percent_passes >= 8 ? 0 : last_all_db;
+    if (all_db_now != last_all_db)
     {
-      last_use_db = static_cast<int>(use_db);
-      std::fprintf(stderr, "[nam_disp] gain curve: %s (Level descs in dB: %s, Tone: %s, all in dB: %s)\n",
-                   use_db ? "dB" : "PERCENT (old curve)", any_level ? "some" : "none", any_tone ? "some" : "none",
-                   all_db ? "yes" : "no");
+      last_all_db = all_db_now;
+      std::fprintf(stderr, "[nam_disp] NAM INPUT / OUTPUT faders read in %s\n", all_db_now ? "dB" : "PERCENT");
     }
-    for (int k = 0; k < kMaxInstances; ++k)
-      if (g_instances[k].is_eng.load(std::memory_order_relaxed))
-        g_instances[k].disp_db.store(use_db, std::memory_order_relaxed);
     if (n_models != last_models)
     {
       last_models = n_models;
@@ -2402,6 +2830,599 @@ void display_watcher()
   }
 }
 } // namespace
+
+// ---- additive Reverb pedals: engine classification and the Dattorro reverb instances -----------------------------
+
+namespace
+{
+constexpr int kMaxEngKinds = 16;
+constexpr int kMaxReverbs = 8;
+struct EngKind
+{
+  std::atomic<uintptr_t> eng{0};
+  std::atomic<int> reverb_slot{-2}; // -2 unresolved, -1 not a reverb, >= 0 index into g_reverbs
+  int tries = 0;                    // resolution attempts so far (audio thread only)
+  std::atomic<int> rec{-1};         // recorded at creation (nam_eng_record): -1 never, 0 NAM, 1 Reverb
+  std::atomic<int> name_slot{-1};   // quality::g_names slot of the pedal's name (nam_eng_record), -1 unknown
+};
+EngKind g_eng_kinds[kMaxEngKinds];
+reverb::Unit g_reverbs[kMaxReverbs]; // zero-initialised static storage, select() on first use
+std::atomic<uint32_t> g_reverbs_used{0}; // reverb units in use (a bit each in g_unit_mask)
+std::atomic<uint32_t> g_unit_mask{0};
+std::atomic<uint32_t> g_rec_next{0}; // round-robin victim when every EngKind slot is taken
+
+// Claims a free reverb unit (index into g_reverbs) or returns -1.
+int alloc_unit()
+{
+  uint32_t m = g_unit_mask.load(std::memory_order_relaxed);
+  for (;;)
+  {
+    int i = 0;
+    while (i < kMaxReverbs && (m >> i & 1u))
+      ++i;
+    if (i >= kMaxReverbs)
+      return -1;
+    if (g_unit_mask.compare_exchange_weak(m, m | 1u << i, std::memory_order_acq_rel))
+    {
+      g_reverbs_used.fetch_add(1, std::memory_order_relaxed);
+      g_reverbs[i].algo = -1; // select()ed by the first block
+      return i;
+    }
+  }
+}
+void free_unit(int i)
+{
+  if (i >= 0 && i < kMaxReverbs && (g_unit_mask.fetch_and(~(1u << i)) >> i & 1u))
+    g_reverbs_used.fetch_sub(1, std::memory_order_relaxed);
+}
+bool g_reverb_was_bypassed[kMaxReverbs];
+
+// Looks `eng` up in the engine table the engine stub fills ({count, 8 x {engine, &name QString}}) and reports
+// whether its pedal is named "Reverb" / "Reverb 2". Only reads memory, never allocates: runs once per engine.
+// safe_read, except that where process_vm_readv does not exist (ENOSYS: qemu-user in the test harness) the address,
+// which comes from the engine table and the name it points at, is read directly.
+bool peek(uintptr_t addr, void* out, size_t n)
+{
+  if (safe_read(addr, out, n))
+    return true;
+  if (errno != ENOSYS || addr < 0x10000)
+    return false;
+  std::memcpy(out, reinterpret_cast<const void*>(addr), n);
+  return true;
+}
+bool peek_u32(uintptr_t a, uint32_t* v) { return peek(a, v, 4); }
+
+// 1 = named "Reverb...", 0 = another pedal (or not in the table), -1 = in the table but its name is unreadable (yet)
+int engine_named_reverb(uintptr_t eng)
+{
+  static const uintptr_t tab = []() -> uintptr_t {
+    const char* e = std::getenv("NAM_ENG_TAB_ADDR");
+    return e ? static_cast<uintptr_t>(std::strtoul(e, nullptr, 0)) : 0;
+  }();
+  uint32_t count;
+  if (!tab || !peek_u32(tab, &count))
+    return 0;
+  for (uint32_t i = 0; i < count && i < 8; ++i)
+  {
+    uint32_t e, qs;
+    if (!peek_u32(tab + 4 + 8 * i, &e) || e != eng || !peek_u32(tab + 8 + 8 * i, &qs))
+      continue;
+    uint32_t d, size, off;
+    if (!peek_u32(qs, &d) || !peek_u32(d + 4, &size) || !peek_u32(d + 12, &off) || size == 0 || size > 80)
+      return -1;
+    if (size < 6)
+      return 0;
+    static const char kName[] = "Reverb";
+    for (uint32_t k = 0; k < 6; ++k)
+    {
+      uint16_t c;
+      if (!peek(d + off + 2 * k, &c, 2))
+        return -1;
+      if (c != static_cast<uint16_t>(kName[k]))
+        return 0;
+    }
+    return 1;
+  }
+  return 0;
+}
+} // namespace
+
+// the quality name slot nam_eng_record found for this engine's pedal, -1 if none (audio thread: a few atomic loads)
+static int eng_name_slot(void* eng)
+{
+  const uintptr_t key = reinterpret_cast<uintptr_t>(eng);
+  for (int i = 0; i < kMaxEngKinds; ++i)
+    if (g_eng_kinds[i].eng.load(std::memory_order_acquire) == key)
+      return g_eng_kinds[i].name_slot.load(std::memory_order_acquire);
+  return -1;
+}
+
+static bool eng_is_reverb(void* eng)
+{
+  const uintptr_t key = reinterpret_cast<uintptr_t>(eng);
+  EngKind* k = nullptr;
+  for (int i = 0; i < kMaxEngKinds && !k; ++i)
+    if (g_eng_kinds[i].eng.load(std::memory_order_acquire) == key)
+      k = &g_eng_kinds[i];
+  for (int i = 0; i < kMaxEngKinds && !k; ++i) // first sight of this engine: claim a slot
+  {
+    uintptr_t expected = 0;
+    if (g_eng_kinds[i].eng.compare_exchange_strong(expected, key, std::memory_order_acq_rel))
+      k = &g_eng_kinds[i];
+  }
+  if (!k)
+    return false; // table full: treat as NAM
+  int slot = k->reverb_slot.load(std::memory_order_acquire);
+  if (slot != -2)
+    return slot >= 0;
+  const int rec = k->rec.load(std::memory_order_acquire);
+  if (rec >= 0) // classified when the pedal was created (nam_eng_record)
+  {
+    slot = rec > 0 ? alloc_unit() : -1;
+    std::fprintf(stderr, "[nam_eng] engine %p -> %s\n", eng, slot >= 0 ? "Reverb" : "NAM");
+    k->reverb_slot.store(slot, std::memory_order_release);
+    return slot >= 0;
+  }
+  // Resolve the pedal name from the engine table. The name QString is read at the first calls, right after the pedal
+  // was created; if it cannot be read yet it is retried for a while, then the engine counts as NAM.
+  const int r = engine_named_reverb(key);
+  if (r < 0 && ++k->tries < 256)
+    return false;
+  slot = r > 0 ? alloc_unit() : -1;
+  std::fprintf(stderr, "[nam_eng] engine %p -> %s (%d tries)\n", eng, slot >= 0 ? "Reverb" : "NAM", k->tries);
+  k->reverb_slot.store(slot, std::memory_order_release);
+  return slot >= 0;
+}
+
+// Called by the engine stub (builds with a Reverb pedal) with (engine, &pedal name QString) the moment a pedal's engine
+// is created, while the name is still valid. The engine table cannot do this: it keeps a pointer to the caller's
+// temporary QString, which holds something else by the time audio runs. Classifies by the name ("Reverb...") and
+// resets what was cached for this engine address (pedals are created and destroyed while editing a rig).
+extern "C" void nam_eng_record(void* eng, const void* name)
+{
+  bool reverb = false;
+  char text[32] = {}; // the pedal name, ASCII ("NAM 2"), empty if unreadable or too long
+  uint32_t d = 0, size = 0, off = 0;
+  if (peek_u32(reinterpret_cast<uintptr_t>(name), &d) && peek_u32(d + 4, &size) && peek_u32(d + 12, &off) && size >= 1
+      && size < sizeof(text))
+  {
+    for (uint32_t k = 0; k < size; ++k)
+    {
+      uint16_t c;
+      if (!peek(d + off + 2 * k, &c, 2) || c < 0x20 || c > 0x7e)
+      {
+        text[0] = 0;
+        break;
+      }
+      text[k] = static_cast<char>(c);
+    }
+    reverb = std::strncmp(text, "Reverb", 6) == 0;
+  }
+  const uintptr_t key = reinterpret_cast<uintptr_t>(eng);
+  EngKind* k = nullptr;
+  for (int i = 0; i < kMaxEngKinds && !k; ++i)
+    if (g_eng_kinds[i].eng.load(std::memory_order_acquire) == key)
+      k = &g_eng_kinds[i];
+  for (int i = 0; i < kMaxEngKinds && !k; ++i)
+  {
+    uintptr_t expected = 0;
+    if (g_eng_kinds[i].eng.compare_exchange_strong(expected, key, std::memory_order_acq_rel))
+      k = &g_eng_kinds[i];
+  }
+  if (!k) // every slot taken (engines of destroyed pedals): recycle one
+  {
+    k = &g_eng_kinds[g_rec_next.fetch_add(1) % kMaxEngKinds];
+    k->eng.store(key, std::memory_order_release);
+  }
+  // a pedal created again at the same address starts over: release its unit, let the first block classify it
+  free_unit(k->reverb_slot.exchange(-2, std::memory_order_acq_rel));
+  k->tries = 0;
+  k->rec.store(reverb ? 1 : 0, std::memory_order_release);
+  k->name_slot.store(reverb ? -1 : quality::slot_for_name(text), std::memory_order_release);
+  std::fprintf(stderr, "[nam_eng] record engine %p name \"%s\" -> %s\n", eng, text, reverb ? "Reverb" : "other");
+}
+
+// Which algorithm a Reverb pedal runs when nothing overrides it. Two switches that the stock pedal already saves with
+// the preset: Hi-Cut (byte 0x57f, On by default) and Gain (byte 0x57c, Low by default):
+//   Hi-Cut On : Gain Low = plate, Gain High = hall        Hi-Cut Off: Gain Low = room, Gain High = spring
+// The detail page (ui/reverb_ui.qml) shows the result and sets both switches from four buttons. Shimmer is not on
+// the page; it stays reachable through the dev control (`algo shimmer`).
+static int default_reverb_algo(const uint8_t* eng)
+{
+  const bool high = eng[0x57c] != 0;
+  if (eng[0x57f] == 0)
+    return high ? reverb::kSpring : reverb::kRoom;
+  return high ? reverb::kHall : reverb::kPlate;
+}
+
+// ---- dev control: drive the Reverb pedals without touching the device (tools/hrdev.py) -----------------------------
+// A control thread polls /tmp/nam_ctl; the shell writes commands there (one per line, written to a temp file and
+// renamed so the thread never reads half a file):
+//   algo plate|hall|shimmer|auto     force an algorithm (auto = the Gain switch decides)
+//   knob decay|mix|damp <0..1|auto>  force a knob (auto = the pedal's own value)
+//   inject impulse|noise|sine|pluck <seconds> [amp] [hz]   replace the pedal's input with a test signal
+//   capture <seconds>                record the reverb output (max 8 s) to /tmp/nam_cap.wav (16 bit stereo)
+//   dump                             raw bytes of the first Reverb engine (find where other switches live)
+//   reset | stat
+// Every command rewrites /tmp/nam_dev.out (key=value lines: algorithm in use, knobs, CPU per block, level, capture).
+// The audio thread only reads atomics and fills preallocated buffers; all file I/O is on the control thread.
+namespace devctl
+{
+constexpr uint32_t kCapFrames = 48000u * 8u;
+std::atomic<int> algo{-1};
+std::atomic<float> knob[3] = {{-1.0f}, {-1.0f}, {-1.0f}}; // decay, mix, damp; < 0 = from the engine
+std::atomic<int> inj_kind{0};                               // 0 off, 1 impulse, 2 noise, 3 sine, 4 pluck
+std::atomic<int32_t> inj_left{0};                           // frames of test signal still to play
+std::atomic<float> inj_amp{0.3f}, inj_hz{220.0f};
+std::atomic<int> inj_restart{0};
+std::atomic<uint32_t> cap_frames{0};                        // frames wanted; set by the control thread
+std::atomic<int> cap_state{0};                              // 0 idle, 1 recording, 2 done
+int16_t cap_buf[2][kCapFrames];
+uint32_t cap_pos;
+// statistics of the first Reverb engine (written by the audio thread, read racily by the control thread)
+std::atomic<uint32_t> blocks{0}, overruns{0};
+std::atomic<float> avg_us{0.0f}, max_us{0.0f}, budget_us{0.0f}, peak{0.0f}, rms_sum{0.0f}, rms_n{0.0f};
+std::atomic<int> used_algo{-1};
+std::atomic<int> frames_per_block{0};
+
+// generator state, audio thread only
+uint32_t inj_pos, rng = 0x12345678u;
+float sine_ph;
+float ks[1024];
+uint32_t ks_len, ks_i;
+
+float noise()
+{
+  rng ^= rng << 13;
+  rng ^= rng >> 17;
+  rng ^= rng << 5;
+  return static_cast<float>(static_cast<int32_t>(rng)) * (1.0f / 2147483648.0f);
+}
+
+// fills one block of the test signal into `dst`
+void generate(float* dst, int32_t n)
+{
+  const int kind = inj_kind.load(std::memory_order_relaxed);
+  const float amp = inj_amp.load(std::memory_order_relaxed), hz = inj_hz.load(std::memory_order_relaxed);
+  if (inj_restart.exchange(0, std::memory_order_acq_rel))
+  {
+    inj_pos = 0;
+    sine_ph = 0.0f;
+    ks_len = std::min<uint32_t>(1024, std::max<uint32_t>(8, static_cast<uint32_t>(kSampleRate / std::max(hz, 50.0f))));
+    for (uint32_t i = 0; i < ks_len; ++i)
+      ks[i] = noise();
+    ks_i = 0;
+  }
+  for (int32_t i = 0; i < n; ++i, ++inj_pos)
+  {
+    float v = 0.0f;
+    switch (kind)
+    {
+    case 1:
+      v = inj_pos == 0 ? amp : 0.0f;
+      break;
+    case 2:
+      v = amp * noise();
+      break;
+    case 3:
+      v = amp * std::sin(sine_ph);
+      sine_ph += 6.2831853f * hz / static_cast<float>(kSampleRate);
+      if (sine_ph > 6.2831853f)
+        sine_ph -= 6.2831853f;
+      break;
+    case 4: // Karplus-Strong: a plucked string, a stand-in for a guitar note
+    {
+      const uint32_t j = (ks_i + 1) % ks_len;
+      v = amp * ks[ks_i];
+      ks[ks_i] = 0.4985f * (ks[ks_i] + ks[j]);
+      ks_i = j;
+      break;
+    }
+    default:
+      break;
+    }
+    dst[i] = v;
+  }
+}
+
+void write_file(const char* path, const char* text)
+{
+  char tmp[96];
+  std::snprintf(tmp, sizeof tmp, "%s.tmp", path);
+  if (FILE* f = std::fopen(tmp, "w"))
+  {
+    std::fputs(text, f);
+    std::fclose(f);
+    std::rename(tmp, path);
+  }
+}
+
+void write_wav()
+{
+  const uint32_t n = std::min<uint32_t>(cap_pos, kCapFrames);
+  FILE* f = std::fopen("/tmp/nam_cap.wav.tmp", "wb");
+  if (!f)
+    return;
+  const uint32_t data = n * 4, riff = 36 + data, rate = 48000, br = rate * 4, fmt = 16;
+  const uint16_t pcm = 1, ch = 2, ba = 4, bits = 16;
+  std::fwrite("RIFF", 1, 4, f);
+  std::fwrite(&riff, 4, 1, f);
+  std::fwrite("WAVEfmt ", 1, 8, f);
+  std::fwrite(&fmt, 4, 1, f);
+  std::fwrite(&pcm, 2, 1, f);
+  std::fwrite(&ch, 2, 1, f);
+  std::fwrite(&rate, 4, 1, f);
+  std::fwrite(&br, 4, 1, f);
+  std::fwrite(&ba, 2, 1, f);
+  std::fwrite(&bits, 2, 1, f);
+  std::fwrite("data", 1, 4, f);
+  std::fwrite(&data, 4, 1, f);
+  for (uint32_t i = 0; i < n; ++i)
+  {
+    const int16_t s[2] = {cap_buf[0][i], cap_buf[1][i]};
+    std::fwrite(s, 2, 2, f);
+  }
+  std::fclose(f);
+  std::rename("/tmp/nam_cap.wav.tmp", "/tmp/nam_cap.wav");
+}
+
+void write_status(const char* extra)
+{
+  char b[1400];
+  const float n = std::max(rms_n.load(), 1.0f);
+  const float rms = 10.0f * std::log10(rms_sum.load() / n + 1e-20f);
+  const int cs = cap_state.load();
+  float k[3];
+  for (int i = 0; i < 3; ++i)
+    k[i] = knob[i].load();
+  int len = std::snprintf(
+      b, sizeof b,
+      "reverbs=%u\nalgo_forced=%s\nalgo_used=%s\nknob_forced=%.2f,%.2f,%.2f\nblock_frames=%d\nblocks=%u\n"
+      "avg_us=%.1f\nmax_us=%.1f\nbudget_us=%.1f\nload_pct=%.1f\noverruns=%u\npeak=%.4f\nrms_db=%.1f\n"
+      "inject_left=%d\ncapture=%s\n",
+      g_reverbs_used.load(), algo.load() < 0 ? "auto" : reverb::algo_name(algo.load()),
+      reverb::algo_name(used_algo.load()), static_cast<double>(k[0]), static_cast<double>(k[1]),
+      static_cast<double>(k[2]), frames_per_block.load(), blocks.load(), static_cast<double>(avg_us.load()),
+      static_cast<double>(max_us.load()), static_cast<double>(budget_us.load()),
+      static_cast<double>(budget_us.load() > 0 ? 100.0f * avg_us.load() / budget_us.load() : 0.0f), overruns.load(),
+      static_cast<double>(peak.load()), static_cast<double>(rms), inj_left.load(),
+      cs == 0 ? "idle" : cs == 1 ? "recording" : "done:/tmp/nam_cap.wav");
+  if (extra && len > 0 && len < static_cast<int>(sizeof b))
+    std::snprintf(b + len, sizeof b - static_cast<size_t>(len), "%s", extra);
+  write_file("/tmp/nam_dev.out", b);
+}
+
+void reset_stats()
+{
+  blocks = 0;
+  overruns = 0;
+  avg_us = 0.0f;
+  max_us = 0.0f;
+  peak = 0.0f;
+  rms_sum = 0.0f;
+  rms_n = 0.0f;
+}
+
+void dump_engine(char* out, size_t cap)
+{
+  size_t o = 0;
+  o += static_cast<size_t>(std::snprintf(out, cap, "dump_base=0x530\n"));
+  for (int i = 0; i < kMaxEngKinds; ++i)
+  {
+    if (g_eng_kinds[i].reverb_slot.load() < 0)
+      continue;
+    const uintptr_t e = g_eng_kinds[i].eng.load();
+    uint8_t bytes[0x80] = {};
+    if (!safe_read(e + 0x530, bytes, sizeof bytes))
+      continue;
+    o += static_cast<size_t>(std::snprintf(out + o, cap - o, "dump_slot%d=", g_eng_kinds[i].reverb_slot.load()));
+    for (size_t k = 0; k < sizeof bytes && o + 3 < cap; ++k)
+      o += static_cast<size_t>(std::snprintf(out + o, cap - o, "%02x", bytes[k]));
+    o += static_cast<size_t>(std::snprintf(out + o, cap - o, "\n"));
+    return;
+  }
+}
+
+void handle_line(char* line, char* extra, size_t extra_cap)
+{
+  char a[24] = {}, b[24] = {};
+  float x = 0, y = 0, z = 0;
+  const int n = std::sscanf(line, "%23s %23s %f %f %f", a, b, &x, &y, &z);
+  if (n < 1)
+    return;
+  if (!std::strcmp(a, "algo") && n >= 2)
+  {
+    int v = -1;
+    for (int i = 0; i < reverb::kAlgoCount; ++i)
+      if (!std::strcmp(b, reverb::algo_name(i)))
+        v = i;
+    algo = v;
+  }
+  else if (!std::strcmp(a, "knob") && n >= 3)
+  {
+    const int i = !std::strcmp(b, "decay") ? 0 : !std::strcmp(b, "mix") ? 1 : !std::strcmp(b, "damp") ? 2 : -1;
+    if (i >= 0)
+      knob[i] = x;
+  }
+  else if (!std::strcmp(a, "knob") && n == 2 && !std::strcmp(b, "auto"))
+    for (auto& k : knob)
+      k = -1.0f;
+  else if (!std::strcmp(a, "inject") && n >= 3)
+  {
+    const int kind = !std::strcmp(b, "impulse") ? 1 : !std::strcmp(b, "noise") ? 2 : !std::strcmp(b, "sine") ? 3
+                     : !std::strcmp(b, "pluck") ? 4 : 0;
+    inj_amp = n >= 4 ? y : 0.3f;
+    inj_hz = n >= 5 ? z : 220.0f;
+    inj_left = 0;
+    inj_kind = kind;
+    inj_restart = 1;
+    inj_left = kind ? static_cast<int32_t>(x * static_cast<float>(kSampleRate)) : 0;
+  }
+  else if (!std::strcmp(a, "capture") && n >= 2)
+  {
+    cap_pos = 0;
+    cap_frames = 0;
+    cap_state = 1;
+    cap_frames = static_cast<uint32_t>(std::min(8.0, std::max(0.1, static_cast<double>(std::atof(b)))) * kSampleRate);
+  }
+  else if (!std::strcmp(a, "dump"))
+    dump_engine(extra, extra_cap);
+  else if (!std::strcmp(a, "reset"))
+  {
+    algo = -1;
+    for (auto& k : knob)
+      k = -1.0f;
+    inj_left = 0;
+    cap_state = 0;
+    reset_stats();
+  }
+}
+
+void control_thread()
+{
+  char text[2048];
+  for (;;)
+  {
+    usleep(100 * 1000);
+    if (cap_state.load() == 1 && cap_pos >= cap_frames.load() && cap_frames.load() > 0)
+    {
+      write_wav();
+      cap_state = 2;
+      write_status(nullptr);
+    }
+    FILE* f = std::fopen("/tmp/nam_ctl", "r");
+    if (!f)
+      continue;
+    const size_t got = std::fread(text, 1, sizeof text - 1, f);
+    std::fclose(f);
+    std::remove("/tmp/nam_ctl");
+    text[got] = 0;
+    char extra[900] = {};
+    for (char* p = text; *p;)
+    {
+      char* e = std::strchr(p, '\n');
+      if (e)
+        *e = 0;
+      handle_line(p, extra, sizeof extra);
+      if (!e)
+        break;
+      p = e + 1;
+    }
+    usleep(150 * 1000); // let the audio thread run a few blocks under the new settings before the numbers are written
+    write_status(extra);
+  }
+}
+} // namespace devctl
+
+// starts the control thread (once); called from nam_eng_init, and directly by the ARM test
+extern "C" void nam_devctl_start()
+{
+  static std::atomic<bool> started{false};
+  bool expected = false;
+  if (started.compare_exchange_strong(expected, true))
+    spawn_detached([]() { devctl::control_thread(); });
+}
+
+static void reverb_process(void* eng, float** input, uint32_t numChannels, float** output, int32_t numFrames)
+{
+  if (numFrames <= 0 || !input || !output || !input[0] || !output[0] || numChannels == 0)
+    return;
+  if (numChannels > 2)
+    numChannels = 2;
+  int slot = -1;
+  for (int i = 0; i < kMaxEngKinds; ++i)
+    if (g_eng_kinds[i].eng.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(eng))
+    {
+      slot = g_eng_kinds[i].reverb_slot.load(std::memory_order_acquire);
+      break;
+    }
+  if (slot < 0)
+    return;
+  const uint8_t* b = static_cast<const uint8_t*>(eng);
+  const auto knob = [b](size_t off) { return std::clamp(*reinterpret_cast<const float*>(b + off), 0.0f, 1.0f); };
+  auto& rv = g_reverbs[slot];
+  if (b[0x26b] != 0) // bypassed: dry; the tail is dropped so it does not reappear on re-engage
+  {
+    for (uint32_t ch = 0; ch < numChannels; ++ch)
+      if (input[ch] && output[ch] && input[ch] != output[ch])
+        std::memcpy(output[ch], input[ch], static_cast<size_t>(numFrames) * sizeof(float));
+    if (!g_reverb_was_bypassed[slot])
+    {
+      rv.clear();
+      g_reverb_was_bypassed[slot] = true;
+    }
+    return;
+  }
+  g_reverb_was_bypassed[slot] = false;
+
+  const int forced = devctl::algo.load(std::memory_order_relaxed);
+  rv.select(forced >= 0 ? forced : default_reverb_algo(b), kSampleRate);
+  const auto forced_knob = [](int i, float engine_value) {
+    const float k = devctl::knob[i].load(std::memory_order_relaxed);
+    return k >= 0.0f ? std::min(k, 1.0f) : engine_value;
+  };
+  const float decay = forced_knob(0, knob(0x554)), mix = forced_knob(1, knob(0x540)), damp = forced_knob(2, knob(0x568));
+
+  // test signal in place of the guitar (dev control); chunks of up to 512 frames
+  static float gen[2][512];
+  const bool is_first = slot == 0;
+  int32_t done = 0;
+  while (done < numFrames)
+  {
+    const int32_t n = std::min<int32_t>(numFrames - done, 512);
+    float* ip[2] = {input[0] + done, (numChannels > 1 && input[1] ? input[1] : input[0]) + done};
+    float* op[2] = {output[0] + done, (numChannels > 1 && output[1] ? output[1] : output[0]) + done};
+    const int32_t left = devctl::inj_left.load(std::memory_order_relaxed);
+    if (left > 0)
+    {
+      devctl::generate(gen[0], n);
+      std::memcpy(gen[1], gen[0], static_cast<size_t>(n) * sizeof(float));
+      for (int ch = 0; ch < 2; ++ch)
+        ip[ch] = gen[ch];
+      devctl::inj_left.store(std::max<int32_t>(0, left - n), std::memory_order_relaxed);
+      if (left - n <= 0)
+        devctl::inj_kind.store(0, std::memory_order_relaxed);
+    }
+    timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rv.process(ip, op, numChannels, n, mix, decay, damp);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (is_first)
+    {
+      const float us = static_cast<float>(t1.tv_sec - t0.tv_sec) * 1e6f + static_cast<float>(t1.tv_nsec - t0.tv_nsec) * 1e-3f;
+      const float budget = static_cast<float>(n) / static_cast<float>(kSampleRate) * 1e6f;
+      devctl::budget_us.store(budget, std::memory_order_relaxed);
+      devctl::frames_per_block.store(n, std::memory_order_relaxed);
+      devctl::used_algo.store(rv.algo, std::memory_order_relaxed);
+      devctl::avg_us.store(devctl::avg_us.load(std::memory_order_relaxed) * 0.98f + us * 0.02f, std::memory_order_relaxed);
+      if (us > devctl::max_us.load(std::memory_order_relaxed))
+        devctl::max_us.store(us, std::memory_order_relaxed);
+      if (us > budget)
+        devctl::overruns.fetch_add(1, std::memory_order_relaxed);
+      devctl::blocks.fetch_add(1, std::memory_order_relaxed);
+      float pk = devctl::peak.load(std::memory_order_relaxed), ss = 0.0f;
+      for (int32_t i = 0; i < n; ++i)
+      {
+        pk = std::max(pk, std::fabs(op[0][i]));
+        ss += op[0][i] * op[0][i];
+      }
+      devctl::peak.store(pk, std::memory_order_relaxed);
+      devctl::rms_sum.store(devctl::rms_sum.load(std::memory_order_relaxed) + ss, std::memory_order_relaxed);
+      devctl::rms_n.store(devctl::rms_n.load(std::memory_order_relaxed) + static_cast<float>(n), std::memory_order_relaxed);
+      if (devctl::cap_state.load(std::memory_order_relaxed) == 1)
+      {
+        for (int32_t i = 0; i < n && devctl::cap_pos < devctl::cap_frames.load(std::memory_order_relaxed)
+                                      && devctl::cap_pos < devctl::kCapFrames;
+             ++i, ++devctl::cap_pos)
+        {
+          devctl::cap_buf[0][devctl::cap_pos] = static_cast<int16_t>(std::clamp(op[0][i], -1.0f, 1.0f) * 32767.0f);
+          devctl::cap_buf[1][devctl::cap_pos] = static_cast<int16_t>(std::clamp(op[1][i], -1.0f, 1.0f) * 32767.0f);
+        }
+      }
+    }
+    done += n;
+  }
+}
 
 extern "C" void nam_eng_init(const uint32_t* triples, uint32_t count, void* builder)
 {
@@ -2416,4 +3437,6 @@ extern "C" void nam_eng_init(const uint32_t* triples, uint32_t count, void* buil
   std::fprintf(stderr, "[nam_disp] init: builder=%p triples=%u eng_tab=%#lx\n", builder, count,
                static_cast<unsigned long>(g_disp.eng_tab));
   spawn_detached([]() { display_watcher(); });
+  nam_devctl_start();
+  quality::start();
 }

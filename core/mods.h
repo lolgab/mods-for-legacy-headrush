@@ -20,10 +20,11 @@
 
 typedef enum
 {
-  NAM_MOD_NAM_PEDALS = 0, /* new "NAM" and "NAM TWO" pedals (Pedalboard), see spy_patch.h */
+  NAM_MOD_NAM_PEDALS = 0, /* new "NAM" and "NAM TWO" pedals (MX5 / Gigboard: experimental), see spy_patch.h */
+  NAM_MOD_REVERB_PEDAL,   /* with the NAM pedals: also "Reverb" and "Reverb 2", see docs/REVERB_PEDAL.md */
   NAM_MOD_ANXIETY,        /* NAM in Anxiety OD (v1) -- the original hijack */
   NAM_MOD_ANXIETY_V2,     /* also hijack Anxiety OD V2: up to 4 hijacked instances */
-  NAM_MOD_PAGE_PEDAL,     /* footswitches -> USB keyboard Page Down/Up (Pedalboard), see page_pedal.h */
+  NAM_MOD_PAGE_PEDAL,     /* footswitches -> USB keyboard Page Up/Down (Pedalboard), see page_pedal.h */
   NAM_MOD_USB_CONSOLE,    /* root shell + data channel over USB serial */
   NAM_MOD_REMOTE_SCREEN, /* mirror/control the screen from a computer */
   NAM_MOD_TUNER_TEMPO,   /* tap the tuner's tempo box to change BPM */
@@ -52,13 +53,19 @@ typedef struct
   bool enabled[NAM_MOD_COUNT];
 } NamModSelection;
 
-/* What gets installed when the user picks nothing else: the NAM pedals on
- * the Pedalboard, the Anxiety OD hijack on models without NAM pedals. */
+/* What gets installed when the user picks nothing else: the NAM pedals where
+ * they are confirmed on hardware (the Pedalboard), the Anxiety OD hijack
+ * elsewhere (MX5 / Gigboard, whose NAM pedals are experimental and opt-in). */
 NamModSelection nam_mods_default(const char* model_name);
 
 const NamModInfo* nam_mod_by_key(const char* key);
 
 bool nam_mod_supports_model(const NamModInfo* mod, const char* model_name);
+
+/* True if the mod can be applied to the model but has never run on that
+ * device (the NAM / Reverb pedals on the MX5 and Gigboard: their patch
+ * points come from core/spy_targets.c, derived from the Pedalboard's). */
+bool nam_mod_is_experimental(const NamModInfo* mod, const char* model_name);
 
 /* Human-readable list of the models a mod supports, e.g. "mx5" or
  * "pedalboard, mx5, gigboard". Returns a static buffer. */
@@ -66,7 +73,9 @@ const char* nam_mod_models_str(const NamModInfo* mod);
 
 /* Checks a selection against a model: at least one mod selected, every
  * selected mod supports the model, and every selected mod's requirement
- * is also selected. On failure writes the reason into err. */
+ * is also selected; on the Pedalboard, the Reverb pedals and the Anxiety OD
+ * hijack are not both selected (they don't fit in its code cave together).
+ * On failure writes the reason into err. */
 bool nam_mods_validate(const NamModSelection* sel, const char* model_name, char* err, size_t err_size);
 
 /* Comma-separated keys of the selected mods, e.g. "anxiety-hijack,usb-console".

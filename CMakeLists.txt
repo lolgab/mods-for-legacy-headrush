@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(headrush_nam_gui C)
+project(nam_mod_gui C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -29,6 +29,12 @@ set(NAM_BLOBS_GENERATED_SOURCES
   ${NAM_BLOBS_GENERATED_DIR}/blob_trampoline_gonk.c
   ${NAM_BLOBS_GENERATED_DIR}/blob_pagepedal.c
   ${NAM_BLOBS_GENERATED_DIR}/blob_pagepedal_usb_sh.c
+  ${NAM_BLOBS_GENERATED_DIR}/blob_ui_pedal.c
+  ${NAM_BLOBS_GENERATED_DIR}/blob_ui_nam.c
+  ${NAM_BLOBS_GENERATED_DIR}/blob_ui_reverb.c
+  ${NAM_BLOBS_GENERATED_DIR}/blob_ui_nam_fix.c
+  ${NAM_BLOBS_GENERATED_DIR}/blob_ui_pedal_art.c
+  ${NAM_BLOBS_GENERATED_DIR}/blob_ui_rig_block.c
 )
 add_custom_command(
   OUTPUT ${NAM_BLOBS_GENERATED_DIR}/blob_nam_hook.c
@@ -74,6 +80,57 @@ add_custom_command(
   VERBATIM
 )
 
+add_custom_command(
+  OUTPUT ${NAM_BLOBS_GENERATED_DIR}/blob_ui_pedal.c
+  COMMAND $<TARGET_FILE:bin2c> ${CMAKE_SOURCE_DIR}/patch/ui/pedal_ui.qml
+          ${NAM_BLOBS_GENERATED_DIR}/blob_ui_pedal.c g_ui_pedal_qml
+  DEPENDS bin2c ${CMAKE_SOURCE_DIR}/patch/ui/pedal_ui.qml
+  COMMENT "Embedding pedal_ui.qml as a C byte array"
+  VERBATIM
+)
+add_custom_command(
+  OUTPUT ${NAM_BLOBS_GENERATED_DIR}/blob_ui_nam.c
+  COMMAND $<TARGET_FILE:bin2c> ${CMAKE_SOURCE_DIR}/patch/ui/nam_ui.qml
+          ${NAM_BLOBS_GENERATED_DIR}/blob_ui_nam.c g_ui_nam_qml
+  DEPENDS bin2c ${CMAKE_SOURCE_DIR}/patch/ui/nam_ui.qml
+  COMMENT "Embedding nam_ui.qml as a C byte array"
+  VERBATIM
+)
+add_custom_command(
+  OUTPUT ${NAM_BLOBS_GENERATED_DIR}/blob_ui_reverb.c
+  COMMAND $<TARGET_FILE:bin2c> ${CMAKE_SOURCE_DIR}/patch/ui/reverb_ui.qml
+          ${NAM_BLOBS_GENERATED_DIR}/blob_ui_reverb.c g_ui_reverb_qml
+  DEPENDS bin2c ${CMAKE_SOURCE_DIR}/patch/ui/reverb_ui.qml
+  COMMENT "Embedding reverb_ui.qml as a C byte array"
+  VERBATIM
+)
+
+add_custom_command(
+  OUTPUT ${NAM_BLOBS_GENERATED_DIR}/blob_ui_nam_fix.c
+  COMMAND $<TARGET_FILE:bin2c> ${CMAKE_SOURCE_DIR}/patch/ui/nam_fix.qml
+          ${NAM_BLOBS_GENERATED_DIR}/blob_ui_nam_fix.c g_ui_nam_fix_qml
+  DEPENDS bin2c ${CMAKE_SOURCE_DIR}/patch/ui/nam_fix.qml
+  COMMENT "Embedding nam_fix.qml as a C byte array"
+  VERBATIM
+)
+
+add_custom_command(
+  OUTPUT ${NAM_BLOBS_GENERATED_DIR}/blob_ui_pedal_art.c
+  COMMAND $<TARGET_FILE:bin2c> ${CMAKE_SOURCE_DIR}/patch/ui/pedal_art.qml
+          ${NAM_BLOBS_GENERATED_DIR}/blob_ui_pedal_art.c g_ui_pedal_art_qml
+  DEPENDS bin2c ${CMAKE_SOURCE_DIR}/patch/ui/pedal_art.qml
+  COMMENT "Embedding pedal_art.qml as a C byte array"
+  VERBATIM
+)
+add_custom_command(
+  OUTPUT ${NAM_BLOBS_GENERATED_DIR}/blob_ui_rig_block.c
+  COMMAND $<TARGET_FILE:bin2c> ${CMAKE_SOURCE_DIR}/patch/ui/rig_block.qml
+          ${NAM_BLOBS_GENERATED_DIR}/blob_ui_rig_block.c g_ui_rig_block_qml
+  DEPENDS bin2c ${CMAKE_SOURCE_DIR}/patch/ui/rig_block.qml
+  COMMENT "Embedding rig_block.qml as a C byte array"
+  VERBATIM
+)
+
 # Same embedding for the non-NAM mods' payloads (see core/mods.h): small
 # text files straight from mods/<mod>/, plus mx5_screen_server, which is
 # cross-compiled into blobs/ with the NAM libraries.
@@ -102,7 +159,9 @@ add_library(nam_gui_core STATIC
   core/fit_image.c
   core/elf_patch.c
   core/spy_patch.c
+  core/spy_targets.c
   core/qml_patch.c
+  core/qml_override.c
   core/ext4_image.c
   core/xz_codec.c
   core/launcher_script.c
@@ -323,26 +382,26 @@ if(SDL2_INCLUDE_DIRS AND SDL2_LIBRARIES)
     # Windows host in this repo) -- see app/main.c's own top comment.
     list(APPEND GUI_APP_SOURCES app/win_repack.c)
   endif()
-  add_executable(headrush-nam-gui ${GUI_APP_SOURCES})
-  target_include_directories(headrush-nam-gui PRIVATE ${SDL2_INCLUDE_DIRS} third_party/nuklear)
-  target_link_libraries(headrush-nam-gui PRIVATE nam_gui_core ${SDL2_LIBRARIES})
-  add_dependencies(headrush-nam-gui nam_gui_blobs)
+  add_executable(nam-mod-gui ${GUI_APP_SOURCES})
+  target_include_directories(nam-mod-gui PRIVATE ${SDL2_INCLUDE_DIRS} third_party/nuklear)
+  target_link_libraries(nam-mod-gui PRIVATE nam_gui_core ${SDL2_LIBRARIES})
+  add_dependencies(nam-mod-gui nam_gui_blobs)
   # Nuklear (NK_IMPLEMENTATION, in app/main.c) calls libm functions
   # (acos/sin/sqrt/...) directly -- on macOS those are folded into
   # libSystem so this is a no-op there, but a separate libm.so is required
   # on Linux or linking fails with "undefined reference to acos@@GLIBC_*".
   find_library(MATH_LIBRARY m)
   if(MATH_LIBRARY)
-    target_link_libraries(headrush-nam-gui PRIVATE ${MATH_LIBRARY})
+    target_link_libraries(nam-mod-gui PRIVATE ${MATH_LIBRARY})
   endif()
   if(APPLE)
-    target_link_libraries(headrush-nam-gui PRIVATE "-framework Cocoa")
+    target_link_libraries(nam-mod-gui PRIVATE "-framework Cocoa")
   endif()
   if(WIN32)
     # ShellExecuteA (app/main.c's nam_open_path) needs shell32.
-    target_link_libraries(headrush-nam-gui PRIVATE shell32)
+    target_link_libraries(nam-mod-gui PRIVATE shell32)
   endif()
 else()
-  message(WARNING "SDL2 not found -- skipping headrush-nam-gui target (gui-core-cli still builds). "
+  message(WARNING "SDL2 not found -- skipping nam-mod-gui target (gui-core-cli still builds). "
                    "macOS: brew install sdl2; Debian/Ubuntu: apt install libsdl2-dev.")
 endif()
