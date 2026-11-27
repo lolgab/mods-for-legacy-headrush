@@ -30,6 +30,7 @@
 #include "model_targets.h"
 #include "nam_library.h"
 #include "patch_pipeline.h"
+#include "spy_patch.h"
 #include "stock_cache.h"
 #include "tempdir.h"
 #include "zip_reader.h"
@@ -168,10 +169,11 @@ typedef struct
   SDL_mutex* mutex;
   AppState state;
   int selected_model;
+  int defaults_model;    /* the model the checkboxes below were last given their defaults for */
   int enable_page_pedal; /* footswitch page-turner mod (Pedalboard only) -- int because nk_checkbox wants int* */
-  int add_nam_pedals;    /* Pedalboard: add the "NAM" and "NAM TWO" pedals (default on) */
+  int add_nam_pedals;    /* add the "NAM" and "NAM TWO" pedals (Pedalboard default; MX5 / Gigboard: experimental, opt-in) */
   int add_reverb_pedals; /* with the NAM pedals: also add "Reverb" and "Reverb 2" (opt-in, untested on hardware) */
-  int anxiety_hijack;    /* opt-in legacy mode: Anxiety OD runs NAM (always on for models without NAM pedals) */
+  int anxiety_hijack;    /* Anxiety OD runs NAM (Pedalboard: opt-in; MX5 / Gigboard: default) */
   bool enable_v2_hijack; /* with the hijack: false = 2 instances (Anxiety OD only), true = up to 4 (also Anxiety OD V2) */
   int accepted_risk;     /* "I own this device and accept the risk" -- Install stays disabled until ticked */
   char log_lines[MAX_LOG_LINES][256];
@@ -410,12 +412,11 @@ static int worker_main(void* data)
   SDL_LockMutex(shared->mutex);
   model_index = shared->selected_model;
   const bool is_pedalboard = strcmp(NAM_MODEL_TARGETS[model_index].name, "pedalboard") == 0;
-  /* only the Pedalboard has the NAM pedals; every other model keeps the Anxiety OD hijack as its only mode */
-  opts.nam_pedals = is_pedalboard && shared->add_nam_pedals != 0;
-  opts.anxiety_hijack = !is_pedalboard || shared->anxiety_hijack != 0;
+  opts.nam_pedals = nam_spy_target(NAM_MODEL_TARGETS[model_index].name) && shared->add_nam_pedals != 0;
+  opts.anxiety_hijack = shared->anxiety_hijack != 0;
   opts.anxiety_v2 = opts.anxiety_hijack && shared->enable_v2_hijack;
   opts.reverb_pedal = opts.nam_pedals && shared->add_reverb_pedals != 0;
-  opts.page_pedal = shared->enable_page_pedal != 0;
+  opts.page_pedal = is_pedalboard && shared->enable_page_pedal != 0;
   shared->downloading = true;
   SDL_UnlockMutex(shared->mutex);
 
@@ -930,20 +931,49 @@ static void draw_frame(Gui* g)
           shared->selected_model = i;
       }
 
-      const bool pedalboard = strcmp(NAM_MODEL_TARGETS[shared->selected_model].name, "pedalboard") == 0;
-      if (pedalboard)
+      const char* model_name = NAM_MODEL_TARGETS[shared->selected_model].name;
+      const bool pedalboard = strcmp(model_name, "pedalboard") == 0;
+      const SpyTarget* spy = nam_spy_target(model_name);
+      const bool experimental = spy && spy->experimental;
+      if (shared->defaults_model != shared->selected_model)
+      {
+        /* each model starts from its own defaults: the Pedalboard from the NAM pedals (confirmed on hardware), the
+         * MX5 / Gigboard from the Anxiety OD hijack (their NAM pedals are experimental, opt-in) */
+        shared->defaults_model = shared->selected_model;
+        shared->add_nam_pedals = spy && !experimental;
+        shared->add_reverb_pedals = 0;
+        shared->anxiety_hijack = !shared->add_nam_pedals;
+      }
+      if (spy)
       {
         nk_layout_row_dynamic(ctx, 28, 1);
-        nk_checkbox_label(ctx, "Add the NAM pedals (\"NAM\", \"NAM TWO\": four per rig)",
+        nk_checkbox_label(ctx,
+                          experimental ? "Add the NAM pedals (\"NAM\", \"NAM TWO\": four per rig) -- EXPERIMENTAL"
+                                       : "Add the NAM pedals (\"NAM\", \"NAM TWO\": four per rig)",
                           &shared->add_nam_pedals);
         nk_layout_row_dynamic(ctx, 28, 1);
         if (shared->add_nam_pedals)
-          nk_checkbox_label(ctx, "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\"; untested on hardware)",
+          nk_checkbox_label(ctx,
+                            experimental ? "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\") -- EXPERIMENTAL"
+                                         : "Also add the Reverb pedals (\"Reverb\", \"Reverb 2\"; untested on hardware)",
                             &shared->add_reverb_pedals);
         else
         {
           shared->add_reverb_pedals = 0;
           nk_label(ctx, "Reverb pedals: need the NAM pedals", NK_TEXT_LEFT);
+        }
+        if (experimental && shared->add_nam_pedals)
+        {
+          const struct nk_color warn = nk_rgb(240, 170, 40);
+          nk_layout_row_dynamic(ctx, 20, 1);
+          nk_label_colored(ctx, "EXPERIMENTAL on this model: ported from the Pedalboard, never run on a real device.",
+                           NK_TEXT_LEFT, warn);
+          nk_layout_row_dynamic(ctx, 20, 1);
+          nk_label_colored(ctx,
+                           strcmp(model_name, "gigboard") == 0
+                               ? "It may not boot. The Gigboard has no footswitch recovery mode: read RECOVERY.md first."
+                               : "It may not boot: know the recovery steps (RECOVERY.md) before you flash it.",
+                           NK_TEXT_LEFT, warn);
         }
         nk_layout_row_dynamic(ctx, 28, 1);
         nk_checkbox_label(ctx, "Also make Anxiety OD run NAM (keeps your existing pedalboards working)",
@@ -982,7 +1012,7 @@ static void draw_frame(Gui* g)
       nk_checkbox_label(ctx, "I own this device and accept the risk (may brick it, voids warranty)",
                         &shared->accepted_risk);
 
-      const bool nothing_selected = pedalboard && !shared->add_nam_pedals && !shared->anxiety_hijack;
+      const bool nothing_selected = !shared->add_nam_pedals && !shared->anxiety_hijack;
       if (nothing_selected)
       {
         nk_layout_row_dynamic(ctx, 20, 1);
@@ -1133,9 +1163,10 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  SDL_Window* win = SDL_CreateWindow(WINDOW_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480,
+  SDL_Window* win = SDL_CreateWindow(WINDOW_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 520,
                                      SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-  SDL_SetWindowMinimumSize(win, 640, 480); /* the layout has fixed row heights and no scrollbar: never smaller */
+  SDL_SetWindowMinimumSize(win, 640, 520); /* the layout has fixed row heights and no scrollbar: never smaller (the
+                                             * tallest case: an experimental model with its two warning lines) */
   SDL_Renderer* renderer = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
   struct nk_context* ctx = nk_sdl_init(win, renderer);

@@ -40,8 +40,9 @@ NAM, so existing pedalboards that use it keep working. See below.
    a patched copy of it in the current directory. On the Pedalboard it adds the
    NAM pedals by default; tick **Also make Anxiety OD run NAM** if you have
    pedalboards that use Anxiety OD as the NAM engine and want to keep them
-   (see "The pedals" below). MX5 and Gigboard don't have the NAM pedals yet and
-   always use the Anxiety OD design. **Install** stays disabled until you tick
+   (see "The pedals" below). MX5 and Gigboard default to the Anxiety OD design;
+   their NAM pedals are **experimental** (see "NAM pedals on the MX5 and
+   Gigboard" below). **Install** stays disabled until you tick
    **I own this device and accept the risk**.
 3. Put your device in firmware-update mode. See
    [this video](https://www.youtube.com/watch?v=6H90kbOCJG8) for a
@@ -142,9 +143,9 @@ page. See [docs/NAM_PEDAL_DISPLAY.md](docs/NAM_PEDAL_DISPLAY.md).
 
 ### Anxiety OD option (all models, opt-in)
 
-Tick **Also make Anxiety OD run NAM** in the installer (Pedalboard; MX5 and
-Gigboard always use it) if you have pedalboards that use Anxiety OD as the
-NAM engine and want to keep them. On the device, add the **Anxiety OD** pedal.
+Tick **Also make Anxiety OD run NAM** in the installer (on by default on the MX5
+and Gigboard) if you have pedalboards that use Anxiety OD as the NAM engine and
+want to keep them. On the device, add the **Anxiety OD** pedal.
 
 | Knob | Function |
 |---|---|
@@ -187,10 +188,31 @@ reboots.
 Switching reloads the model with a short fade. Other (non-A2) models sound the
 same in every mode. Not yet tested on hardware.
 
-## Reverb pedals (optional, Pedalboard only, experimental)
+### NAM pedals on the MX5 and Gigboard (experimental)
+
+The installer offers the NAM and Reverb pedals on the MX5 and Gigboard too,
+marked **EXPERIMENTAL**: off by default, with a warning when you tick them.
+They are the Pedalboard's patches carried over to those firmwares: every
+address was found again in the MX5's and the Gigboard's own `Evil` and checked
+against it, and the build refuses if anything doesn't match, but **nobody has
+run them on a real MX5 or Gigboard yet**. The device may not boot: know the
+recovery steps in [docs/RECOVERY.md](docs/RECOVERY.md) first (the Gigboard has
+no footswitch recovery mode). Differences from the Pedalboard:
+
+- The knob captions under the screen stay **DRIVE / LEVEL / TONE** (they work
+  as MODEL / INPUT / OUTPUT): those two models have no editable tile source.
+- The detail page (model name, Auto / Lite / Full) is scaled to the smaller
+  (MX5) or larger (Gigboard) screen.
+- A third "NAM" can't be added while NAM and NAM 2 are in use (add NAM TWO).
+
+If you try it, please report what happens (boot, pedals in the Distortion list,
+sound, detail page) in an issue.
+
+## Reverb pedals (optional, experimental)
 
 Tick **Also add the Reverb pedals** in the installer (or pass
-`--reverb-pedal` to the CLI; needs the NAM pedals) to add **Reverb** and
+`--reverb-pedal` to the CLI; needs the NAM pedals; on the MX5 and Gigboard see
+the experimental note above) to add **Reverb** and
 **Reverb 2** at the end of the Reverb list. They run Plate, Hall, Room and
 Spring algorithms, picked on the pedal's detail page. **Not yet tested on
 hardware**: keep the `(stock)` updater handy — see
@@ -212,8 +234,8 @@ to move the labels) — see [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md).
 | Device | Status |
 |---|---|
 | HeadRush **Pedalboard** | confirmed on real hardware |
-| HeadRush **MX5** | confirmed on real hardware |
-| HeadRush **Gigboard** | confirmed on real hardware |
+| HeadRush **MX5** | Anxiety OD design confirmed on real hardware; NAM / Reverb pedals experimental, untested |
+| HeadRush **Gigboard** | Anxiety OD design confirmed on real hardware; NAM / Reverb pedals experimental, untested |
 
 **Only flash the update file built for _your exact model and firmware_** —
 flashing another model's file will almost certainly brick the device.

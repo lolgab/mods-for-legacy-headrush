@@ -104,7 +104,7 @@ CLI (local dev/debugging tool only, not built or shipped by CI):
 
 ```sh
 build/gui-core-cli <stock Update.img> <out.img> --model pedalboard|mx5|gigboard \
-    [--anxiety-hijack [--instances 2|4]] [--no-nam-pedals] [--reverb-pedal] [--page-pedal [--page-down-note N] [--page-up-note N]]
+    [--anxiety-hijack [--instances 2|4]] [--nam-pedals | --no-nam-pedals] [--reverb-pedal] [--page-pedal [--page-down-note N] [--page-up-note N]]
 ```
 
 Pedalboard default: adds the **NAM** and **NAM TWO** pedals (four instances) (see
@@ -115,8 +115,10 @@ implies `--anxiety-hijack` (docs/TECHNICAL.md's "Up to 4 instances" section).
 `--no-nam-pedals` leaves the new pedals out (hijack only). `--reverb-pedal` also adds
 **Reverb** / **Reverb 2** (Dattorro plate, docs/REVERB_PEDAL.md; experimental). `--page-pedal` also colours and labels the two page-turner footswitches
 (`--page-down-note` / `--page-up-note`, 0-based, default 10 and 4, move them; see
-docs/PAGE_PEDAL.md). MX5 and Gigboard have
-no NAM pedals yet and always get the Anxiety OD hijack.
+docs/PAGE_PEDAL.md; Pedalboard only). MX5 and Gigboard default to the Anxiety OD
+hijack; `--nam-pedals` adds the NAM pedals there (EXPERIMENTAL, never run on those
+devices; add `--anxiety-hijack` to keep the hijack too). Their addresses are in
+`core/spy_targets.c`, see docs/ADDITIVE_PEDAL.md "Other models".
 
 The GUI caches the stock updater zip it downloads (`core/stock_cache.c`): one
 `<model>-<platform>.zip` plus a `.sha256` sidecar (hash and URL) per model in the

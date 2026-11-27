@@ -6,12 +6,13 @@
  * by CI, see docs/BUILDING.md.
  *
  * usage: gui-core-cli <stock.img> <out.img> --model pedalboard|mx5|gigboard
- *                      [--anxiety-hijack [--instances 2|4]] [--no-nam-pedals] [--reverb-pedal] [--page-pedal [--page-down-note N] [--page-up-note N]]
- *                      [--keep-work-dir]
+ *                      [--anxiety-hijack [--instances 2|4]] [--nam-pedals | --no-nam-pedals] [--reverb-pedal]
+ *                      [--page-pedal [--page-down-note N] [--page-up-note N]] [--keep-work-dir]
  *
  * Pedalboard default: adds the "NAM" and "NAM TWO" pedals (two instances each). --anxiety-hijack additionally (opt-in) makes Anxiety OD run
  * NAM (--instances 4 also hijacks Anxiety OD V2); --no-nam-pedals leaves out the new pedals (hijack only). MX5 and
- * Gigboard have no NAM pedals yet and always get the Anxiety OD hijack.
+ * Gigboard default to the Anxiety OD hijack; --nam-pedals adds the NAM pedals there too (EXPERIMENTAL: derived from
+ * the Pedalboard's patches, never run on those devices), with --anxiety-hijack to keep the hijack as well.
  */
 #include "model_targets.h"
 #include "patch_pipeline.h"
@@ -85,7 +86,7 @@ int main(int argc, char** argv)
   int instances = 2;
   bool page_pedal = false;
   bool anxiety_hijack = false;
-  bool no_nam_pedals = false;
+  bool no_nam_pedals = false, nam_pedals_flag = false;
   bool reverb_pedal = false;
   int page_down_note = -1, page_up_note = -1; /* -1 = the default */
 
@@ -110,6 +111,8 @@ int main(int argc, char** argv)
       anxiety_hijack = true;
     else if (strcmp(argv[i], "--no-nam-pedals") == 0)
       no_nam_pedals = true;
+    else if (strcmp(argv[i], "--nam-pedals") == 0)
+      nam_pedals_flag = true;
     else if (strcmp(argv[i], "--reverb-pedal") == 0)
       reverb_pedal = true;
     else if (strcmp(argv[i], "--page-pedal") == 0)
@@ -127,15 +130,17 @@ int main(int argc, char** argv)
   if (!model_name)
     die("--model is required (pedalboard|mx5|gigboard) -- no default target");
 
-  /* only the Pedalboard has the NAM pedals; the other models keep the original (Anxiety OD) design */
+  /* the NAM pedals are the Pedalboard's default; on the MX5 and the Gigboard they are experimental and opt-in */
+  if (nam_pedals_flag && no_nam_pedals)
+    die("--nam-pedals and --no-nam-pedals contradict each other");
   NamPatchOptions opts = {0};
-  opts.nam_pedals = strcmp(model_name, "pedalboard") == 0 && !no_nam_pedals;
+  opts.nam_pedals = !no_nam_pedals && (strcmp(model_name, "pedalboard") == 0 || nam_pedals_flag);
   opts.anxiety_hijack = anxiety_hijack || !opts.nam_pedals;
   opts.anxiety_v2 = instances == 4;
   opts.page_pedal = page_pedal;
   opts.reverb_pedal = reverb_pedal;
   if (reverb_pedal && !opts.nam_pedals)
-    die("--reverb-pedal needs the NAM pedals (Pedalboard, without --no-nam-pedals)");
+    die("--reverb-pedal needs the NAM pedals (default on the Pedalboard, --nam-pedals on the MX5 / Gigboard)");
   if (page_down_note >= 0 || page_up_note >= 0)
   {
     if (!page_pedal)

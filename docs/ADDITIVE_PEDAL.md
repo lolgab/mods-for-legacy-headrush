@@ -84,6 +84,29 @@ ones.
 | Pedal art | drawn by our own QML (`pedal_art.qml`) in place of the generic picture |
 | In the GUI | shipped since v0.2.1, on by default on the Pedalboard |
 
+## Other models (MX5, Gigboard): experimental
+
+The same patches are offered on the MX5 and the Gigboard, marked experimental in the installer and opt-in
+(`--nam-pedals` on the CLI). **Never run on either device.** All addresses and expected stock words are per model, in
+`core/spy_targets.c` (a `SpyTarget` each; `core/spy_patch.c` holds only the logic). The Pedalboard's are the hand-made
+ones; the build of its image is byte-identical to before the split.
+
+The MX5's and Gigboard's were derived from the Pedalboard's: same source, different builds. Each site was mapped by
+matching masked instruction windows (branch / movw immediates and address literals as wildcards) near an anchor map
+of the two binaries, then checked structurally: the same instruction and immediate at every id site (registers may
+differ), the same call target at every hooked call, the same type array, name / short-name arrays and editor paths,
+the same equality pattern in every id-indexed table and the same number of readers, the same Glorious Drive engine
+code and setters (so the hook library's view of the engine holds), the activate-all walk calling the same function
+177 times. A reverse scan found no id-range constant on those models that the Pedalboard doesn't have. Sites whose
+code is compiled differently there were resolved by hand and checked instruction by instruction: the name-array loop
+bound, the P1 name search and the two T5 readers (both models), and on the Gigboard also the two StateMap-sized
+allocations and the registry constructor's memset size. Differences:
+
+- Descriptor table P3 and its only reader do not exist there: nothing to relocate for it.
+- Hook D (the picker retrying the next two ids) is not installed: the stock picker refuses a third "NAM" while NAM
+  and NAM 2 are in use, and 4-instance pedals are refused.
+- QML: the detail page and Rig block go in (the page is scaled to the editor area); the encoder tiles do not exist.
+
 ## Open items
 
 * Drive readout can show the previous model's name until the value moves again;

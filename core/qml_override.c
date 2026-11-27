@@ -144,7 +144,7 @@ static bool patch_zlib_entry(uint8_t* data, size_t data_len, const char* old, co
   if (hits != 1)
   {
     free(text);
-    set_err(err, err_size, "%s: edit point found %zu times (expected once); not the stock Pedalboard 2.7 Evil", what, hits);
+    set_err(err, err_size, "%s: edit point found %zu times (expected once); not a stock 2.7 Evil", what, hits);
     return false;
   }
 
@@ -219,10 +219,30 @@ bool nam_qml_override_blockdetails(uint8_t* data, size_t data_len, const char* p
   if (!patch_zlib_entry(data, data_len, k_old, repl, k_key, "BlockDetails.qml", err, err_size))
     return false;
   /* the picture on the left: for pedals without a picture of their own (the stock page falls back to Other.png and they
-   * all end up here), a Loader of the drawn pedal; the art shows the stock fallback itself for everything else */
-  static const char k_img[] = "Image {source: \"ModuleEditors/img/Other.png\"";
-  static const char k_art[] = "Loader {source: \"file:///usr/Evil/Resources/pedal_art.qml\"";
-  return patch_zlib_entry(data, data_len, k_img, k_art, k_key, "BlockDetails.qml (picture)", err, err_size);
+   * all end up here), a Loader of the drawn pedal; the art shows the stock fallback itself for everything else. The
+   * fallback Image is written differently per model (Pedalboard, Gigboard, MX5): the first one present is edited. */
+  static const struct
+  {
+    const char *img, *art;
+  } k_pic[] = {
+    {"Image {source: \"ModuleEditors/img/Other.png\"", "Loader {source: \"file:///usr/Evil/Resources/pedal_art.qml\""},
+    {"Image { source: \"ModuleEditors/img/Other.png\"", "Loader { source: \"file:///usr/Evil/Resources/pedal_art.qml\""},
+    {"Image { scale: 0.5; x: -50; y: -67; source: \"ModuleEditors/img/Other.png\"",
+     "Loader { scale: 0.5; x: -50; y: -67; source: \"file:///usr/Evil/Resources/pedal_art.qml\""},
+  };
+  for (size_t i = 0; i < sizeof(k_pic) / sizeof(k_pic[0]); ++i)
+  {
+    char e2[256] = "";
+    if (patch_zlib_entry(data, data_len, k_pic[i].img, k_pic[i].art, k_key, "BlockDetails.qml (picture)", e2, sizeof(e2)))
+      return true;
+    if (!strstr(e2, "found 0 times"))
+    {
+      set_err(err, err_size, "%s", e2);
+      return false;
+    }
+  }
+  set_err(err, err_size, "BlockDetails.qml (picture): no known fallback picture; not a stock 2.7 Evil");
+  return false;
 }
 
 bool nam_qml_override_stomp(uint8_t* data, size_t data_len, char* err, size_t err_size)

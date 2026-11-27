@@ -136,6 +136,7 @@ add_library(nam_gui_core STATIC
   core/fit_image.c
   core/elf_patch.c
   core/spy_patch.c
+  core/spy_targets.c
   core/qml_patch.c
   core/qml_override.c
   core/ext4_image.c

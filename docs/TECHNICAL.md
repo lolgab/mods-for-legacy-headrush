@@ -1,7 +1,8 @@
 # Technical design: the Anxiety OD hijack
 
 > This is the **opt-in, older** design (the installer's "Also make Anxiety OD
-> run NAM" option; the only mode on MX5 and Gigboard). The default on the
+> run NAM" option; the default on MX5 and Gigboard, where the NAM pedals are
+> experimental). The default on the
 > Pedalboard is two new pedals, **NAM** and **NAM TWO** (two instances each), that replace nothing:
 > see [ADDITIVE_PEDAL.md](ADDITIVE_PEDAL.md) and
 > [NAM_PEDAL_DISPLAY.md](NAM_PEDAL_DISPLAY.md). Both can be installed together;

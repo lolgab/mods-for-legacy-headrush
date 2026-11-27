@@ -219,13 +219,17 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   ElfPatchResult elf_result_v2 = {0};
   bool has_v2_hijack = false;
   uint32_t eng_hook_slot = 0, eng_init_slot = 0, eng_tab = 0;
-  if (nam_pedals && strcmp(target->name, "pedalboard") != 0)
+  const SpyTarget* spy = nam_spy_target(target->name);
+  if (nam_pedals && !spy)
   {
-    set_err(err, err_size,
-            "the NAM pedals are Pedalboard-only so far; selected target is %s (use the Anxiety OD hijack there)",
-            target->name);
+    set_err(err, err_size, "the NAM pedals have no target for %s (use the Anxiety OD hijack there)", target->name);
     goto cleanup;
   }
+  if (nam_pedals && spy->experimental)
+    report(progress, progress_user_data,
+           "!!  EXPERIMENTAL: the NAM%s pedals on the %s were derived from the Pedalboard's and have never run on a "
+           "device",
+           reverb_pedal ? " and Reverb" : "", target->name);
 
   if (anxiety_hijack)
   {
@@ -277,10 +281,11 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
                               {"NAM TWO", "NAM TWO", NAM_ENGINE_TYPE, 0},
                               {"Reverb", "Reverb", NAM_ENGINE_TYPE, 0, NAM_CAT_REVERB}};
     const uint32_t npairs = reverb_pedal ? 3 : 2;
-    if (!nam_elf_patch_registry(evil_data, evil_len, pairs, npairs, err, err_size)
-        || !nam_elf_patch_node_registration(evil_data, evil_len, pairs, npairs, &eng_init_slot, &eng_tab, err,
+    if (!nam_elf_patch_registry(spy, evil_data, evil_len, pairs, npairs, err, err_size)
+        || !nam_elf_patch_node_registration(spy, evil_data, evil_len, pairs, npairs, &eng_init_slot, &eng_tab, err,
                                             err_size)
-        || !nam_elf_patch_engine_class(evil_data, evil_len, 2 * npairs, eng_tab, true, &eng_hook_slot, err, err_size))
+        || !nam_elf_patch_engine_class(spy, evil_data, evil_len, 2 * npairs, eng_tab, true, &eng_hook_slot, err,
+                                       err_size))
       goto cleanup;
     report(progress, progress_user_data,
            "OK  NAM pedals registered: \"NAM\" and \"NAM TWO\" (2 instances each), engine hook_slot @ 0x%x",
@@ -288,22 +293,26 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
     if (reverb_pedal)
       report(progress, progress_user_data, "OK  Reverb pedals registered: \"Reverb\" and \"Reverb 2\" in the Reverb list (Dattorro plate)");
 
+    if (!nam_qml_override_blockdetails(evil_data, evil_len, "file:///usr/Evil/Resources/pedal_ui.qml", err, err_size)
+        || !nam_qml_override_stomp(evil_data, evil_len, err, err_size))
+      goto cleanup;
+    qml_pages = true;
+    report(progress, progress_user_data,
+           "OK  detail pages: BlockDetails.qml loads /usr/Evil/Resources/pedal_ui.qml for the additive pedals; the "
+           "Rig page draws them");
+    /* the encoder tiles (real parameter names under the knobs) exist on the Pedalboard only: the MX5 and the
+     * Gigboard have no EncoderParamInfo.qml / EncoderField.qml source, their knobs keep the Glorious Drive names */
     if (strcmp(target->name, "pedalboard") == 0)
     {
-      if (!nam_qml_override_blockdetails(evil_data, evil_len, "file:///usr/Evil/Resources/pedal_ui.qml", err, err_size))
+      if (!nam_qml_override_encoder_tile(evil_data, evil_len, err, err_size)
+          || !nam_qml_override_encoder_field(evil_data, evil_len, err, err_size))
         goto cleanup;
-      if (!nam_qml_override_encoder_tile(evil_data, evil_len, err, err_size))
-        goto cleanup;
-      if (!nam_qml_override_encoder_field(evil_data, evil_len, err, err_size)
-          || !nam_qml_override_stomp(evil_data, evil_len, err, err_size))
-        goto cleanup;
-      qml_pages = true;
-      report(progress, progress_user_data,
-             "OK  detail pages: BlockDetails.qml loads /usr/Evil/Resources/pedal_ui.qml for the additive pedals; "
-             "EncoderParamInfo.qml shows their real parameter names on the tiles");
+      report(progress, progress_user_data, "OK  EncoderParamInfo.qml shows their real parameter names on the tiles");
     }
     else
-      report(progress, progress_user_data, "    (NAM detail page skipped for %s -- Pedalboard only)", target->name);
+      report(progress, progress_user_data,
+             "    (knob tiles keep the stock DRIVE / LEVEL / TONE captions on the %s: no tile source to edit)",
+             target->name);
   }
 
   if (enable_page_pedal && strcmp(target->name, "pedalboard") != 0)

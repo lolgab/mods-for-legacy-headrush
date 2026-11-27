@@ -1,8 +1,11 @@
 # Custom detail pages (QML)
 
 The detail page of an additive pedal (NAM, NAM TWO, Reverb) shows extra, correct information: the model **number and
-name** for NAM, and an **algorithm selector** for the Reverb. Pedalboard 2.7 only; the patcher refuses on any
-mismatch. Everything here was verified on hardware.
+name** for NAM, and an **algorithm selector** for the Reverb. The patcher refuses on any mismatch. Everything here was
+verified on the Pedalboard. On the MX5 and Gigboard (experimental, untested) the detail page and the Rig page block
+are installed the same way (`pedal_ui.qml` scales the page from 720 px to the MX5's 570 px / the Gigboard's 912 px
+editor area, and the fallback picture is matched in each model's own spelling); the encoder tiles are not, those
+models have no `EncoderParamInfo.qml` / `EncoderField.qml` source.
 
 ## Why the old "patch the embedded QML" attempt failed
 
